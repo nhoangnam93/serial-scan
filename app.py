@@ -441,7 +441,10 @@ DEFAULT_USER_SETTINGS = {
     "active_function": "inventory",
     "serial_profile": DEFAULT_SERIAL_PROFILE,
     "camera_pref": "environment",
+    "camera_tuning_profile": "auto",
+    "camera_tuning_overrides": {},
     "autosave_pref": "1",
+    "auto_scan_start": "1",
     "selected_box_id": "",
 }
 ALLOWED_FUNCTIONS = {"inventory", "box", "import"}
@@ -538,8 +541,32 @@ def sanitize_user_settings(raw):
         cleaned["camera_pref"] = camera_pref
     else:
         cleaned["camera_pref"] = DEFAULT_USER_SETTINGS["camera_pref"]
+    tuning_profile = str(incoming.get("camera_tuning_profile", cleaned.get("camera_tuning_profile", "auto"))).strip().lower()
+    cleaned["camera_tuning_profile"] = tuning_profile if tuning_profile in {"auto", "iphone", "android", "desktop", "aggressive"} else "auto"
+    overrides = incoming.get("camera_tuning_overrides", {}) if isinstance(incoming, dict) else {}
+    if not isinstance(overrides, dict):
+        overrides = {}
+    clean_overrides = {}
+    try:
+        if "minLight" in overrides:
+            clean_overrides["minLight"] = max(28.0, min(72.0, float(overrides.get("minLight"))))
+        if "minEdge" in overrides:
+            clean_overrides["minEdge"] = max(0.020, min(0.090, float(overrides.get("minEdge"))))
+        if "minVariance" in overrides:
+            clean_overrides["minVariance"] = max(90.0, min(360.0, float(overrides.get("minVariance"))))
+        if "centerY" in overrides:
+            clean_overrides["centerY"] = max(0.48, min(0.66, float(overrides.get("centerY"))))
+        if "heightRatio" in overrides:
+            clean_overrides["heightRatio"] = max(0.22, min(0.38, float(overrides.get("heightRatio"))))
+        if "widthRatio" in overrides:
+            clean_overrides["widthRatio"] = max(0.86, min(0.99, float(overrides.get("widthRatio"))))
+    except Exception:
+        clean_overrides = {}
+    cleaned["camera_tuning_overrides"] = clean_overrides
     autosave_pref = str(incoming.get("autosave_pref", cleaned["autosave_pref"])).strip()
     cleaned["autosave_pref"] = "0" if autosave_pref == "0" else "1"
+    auto_scan_start = str(incoming.get("auto_scan_start", cleaned.get("auto_scan_start", "1"))).strip()
+    cleaned["auto_scan_start"] = "0" if auto_scan_start == "0" else "1"
     selected_box_id = str(incoming.get("selected_box_id", cleaned["selected_box_id"])).strip()
     cleaned["selected_box_id"] = selected_box_id[:64] if re.fullmatch(r"[A-Za-z0-9._:-]{0,64}", selected_box_id) else ""
     return cleaned
@@ -1732,6 +1759,38 @@ html, body {
 .btn-pulse { animation: pulseBtn 2s infinite; }
 
 .input-row { display:flex; gap:6px; margin-top:10px; }
+.tune-advanced {
+  margin-top:8px;
+  border:1px solid var(--border);
+  border-radius:10px;
+  padding:8px 10px;
+  background:rgba(255,255,255,0.03);
+}
+.tune-grid {
+  display:grid;
+  grid-template-columns:repeat(2, minmax(0,1fr));
+  gap:8px 10px;
+  margin-top:8px;
+}
+.tune-row {
+  display:flex;
+  flex-direction:column;
+  gap:4px;
+  min-width:0;
+}
+.tune-row label {
+  font-size:10px;
+  color:var(--text2);
+  font-weight:700;
+}
+.tune-row input[type=\"range\"] {
+  width:100%;
+}
+.tune-val {
+  font-size:10px;
+  color:var(--text3);
+  font-family:'JetBrains Mono',monospace;
+}
 .input-f {
   flex:1; padding:10px 12px; border-radius:var(--radius-sm);
   border:1px solid var(--border); background:var(--bg-input);
@@ -2245,6 +2304,9 @@ html, body {
   .check-head {
     flex-wrap:wrap;
   }
+  .tune-grid {
+    grid-template-columns:1fr;
+  }
   .reader-icon-btn {
     width:56px;
     height:56px;
@@ -2447,10 +2509,16 @@ html, body {
       <div class="card">
         <div class="card-head">
           <div class="card-title">📷 Scanner</div>
-          <label style="display:flex;align-items:center;gap:5px;font-size:10px;color:var(--text2);cursor:pointer;">
-            <input type="checkbox" id="autosave" checked onchange="onAutosaveChange()" style="accent-color:var(--nab-red);">
-            Auto-save
-          </label>
+          <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+            <label style="display:flex;align-items:center;gap:5px;font-size:10px;color:var(--text2);cursor:pointer;">
+              <input type="checkbox" id="autosave" checked onchange="onAutosaveChange()" style="accent-color:var(--nab-red);">
+              Auto-save
+            </label>
+            <label style="display:flex;align-items:center;gap:5px;font-size:10px;color:var(--text2);cursor:pointer;">
+              <input type="checkbox" id="autoScanStart" checked onchange="onAutoScanStartChange()" style="accent-color:var(--nab-red);">
+              Auto-start
+            </label>
+          </div>
         </div>
         <div class="card-body">
           <div class="reader-shell">
@@ -2482,6 +2550,53 @@ html, body {
             <button class="serial-profile-btn active" id="profileAppleBtn" onclick="setSerialProfile('apple')">Apple Serial</button>
             <button class="serial-profile-btn" id="profileDellBtn" onclick="setSerialProfile('dell')">Dell Service Tag</button>
           </div>
+          <div class="input-row" style="margin-top:8px;">
+            <select class="queue-select" id="cameraTuningSel" onchange="onCameraTuningProfileChange()">
+              <option value="auto">Camera Tuning: Auto</option>
+              <option value="iphone">Camera Tuning: iPhone</option>
+              <option value="android">Camera Tuning: Android</option>
+              <option value="desktop">Camera Tuning: Desktop</option>
+              <option value="aggressive">Camera Tuning: Aggressive OCR</option>
+            </select>
+          </div>
+          <details class="tune-advanced">
+            <summary style="font-size:11px;color:var(--text2);cursor:pointer;">Advanced Camera Tuning</summary>
+            <div class="tune-grid">
+              <div class="tune-row">
+                <label for="tuneMinLight">Min Light</label>
+                <input id="tuneMinLight" type="range" min="28" max="72" step="1" oninput="onTuningOverrideInput('minLight', this.value)">
+                <div class="tune-val" id="tuneMinLightVal">-</div>
+              </div>
+              <div class="tune-row">
+                <label for="tuneMinEdge">Min Edge</label>
+                <input id="tuneMinEdge" type="range" min="20" max="90" step="1" oninput="onTuningOverrideInput('minEdge', this.value)">
+                <div class="tune-val" id="tuneMinEdgeVal">-</div>
+              </div>
+              <div class="tune-row">
+                <label for="tuneMinVariance">Min Blur Score</label>
+                <input id="tuneMinVariance" type="range" min="90" max="360" step="2" oninput="onTuningOverrideInput('minVariance', this.value)">
+                <div class="tune-val" id="tuneMinVarianceVal">-</div>
+              </div>
+              <div class="tune-row">
+                <label for="tuneCenterY">Crop Center Y</label>
+                <input id="tuneCenterY" type="range" min="48" max="66" step="1" oninput="onTuningOverrideInput('centerY', this.value)">
+                <div class="tune-val" id="tuneCenterYVal">-</div>
+              </div>
+              <div class="tune-row">
+                <label for="tuneHeightRatio">Crop Height</label>
+                <input id="tuneHeightRatio" type="range" min="22" max="38" step="1" oninput="onTuningOverrideInput('heightRatio', this.value)">
+                <div class="tune-val" id="tuneHeightRatioVal">-</div>
+              </div>
+              <div class="tune-row">
+                <label for="tuneWidthRatio">Crop Width</label>
+                <input id="tuneWidthRatio" type="range" min="86" max="99" step="1" oninput="onTuningOverrideInput('widthRatio', this.value)">
+                <div class="tune-val" id="tuneWidthRatioVal">-</div>
+              </div>
+            </div>
+            <div style="display:flex;justify-content:flex-end;margin-top:8px;">
+              <button class="btn btn-ghost btn-sm" onclick="resetTuningOverrides()">Reset Advanced</button>
+            </div>
+          </details>
           <div class="input-row">
             <input class="input-f" id="manualInput" placeholder="Type serial…" onkeydown="if(event.key==='Enter') saveManual()">
             <button class="btn btn-red btn-sm" id="manualSaveBtn" onclick="saveManual()">Save</button>
@@ -2654,9 +2769,9 @@ html, body {
   </div>
 </div>
 
-<script src="/static/vendor/socket.io.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
-<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<script src="/static/vendor/socket.io.min.js?v=__APP_BUILD_ID__"></script>
+<script src="https://cdn.jsdelivr.net/npm/html5-qrcode@2.3.8/html5-qrcode.min.js?v=__APP_BUILD_ID__"></script>
+<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js?v=__APP_BUILD_ID__"></script>
 <script>
 // ============================================
 // State
@@ -2722,8 +2837,17 @@ let serialProfile = (localStorage.getItem('nab_serial_profile') || 'apple').toLo
 if (serialProfile !== 'apple' && serialProfile !== 'dell') serialProfile = 'apple';
 let lastConnectErrorToastAt = 0;
 let cameraPreference = localStorage.getItem('nab_camera_pref') || 'environment';
+let cameraTuningProfile = (localStorage.getItem('nab_camera_tuning_profile') || 'auto').toLowerCase();
+if (!['auto', 'iphone', 'android', 'desktop', 'aggressive'].includes(cameraTuningProfile)) cameraTuningProfile = 'auto';
+let cameraTuningOverrides = {};
+try {
+  const raw = localStorage.getItem('nab_camera_tuning_overrides');
+  if (raw) cameraTuningOverrides = JSON.parse(raw) || {};
+} catch (_e) { cameraTuningOverrides = {}; }
 let autosavePref = localStorage.getItem('nab_autosave_pref');
 if (autosavePref !== '0' && autosavePref !== '1') autosavePref = '1';
+let autoScanStartPref = localStorage.getItem('nab_auto_scan_start');
+if (autoScanStartPref !== '0' && autoScanStartPref !== '1') autoScanStartPref = '1';
 let previewCropFilename = '';
 let qrRequestTimer = null;
 let qrRequestInFlight = false;
@@ -2734,6 +2858,8 @@ let settingsSyncTimer = null;
 let settingsAppliedFromServer = false;
 let isUserAuthenticated = false;
 let lastAudioAt = 0;
+let goodFrameStreak = 0;
+let badFrameStreak = 0;
 
 function saveJoinPin(pin) {
   const val = String(pin || '').trim();
@@ -2871,12 +2997,91 @@ function applyCameraPreferenceToUI() {
   }
 }
 
+function normalizeCameraTuningProfile(value) {
+  const v = String(value || '').trim().toLowerCase();
+  return ['auto', 'iphone', 'android', 'desktop', 'aggressive'].includes(v) ? v : 'auto';
+}
+
+function normalizeCameraTuningOverrides(input) {
+  const src = (input && typeof input === 'object') ? input : {};
+  const out = {};
+  const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
+  if (src.minLight != null && !Number.isNaN(Number(src.minLight))) out.minLight = clamp(Number(src.minLight), 28, 72);
+  if (src.minEdge != null && !Number.isNaN(Number(src.minEdge))) out.minEdge = clamp(Number(src.minEdge), 0.020, 0.090);
+  if (src.minVariance != null && !Number.isNaN(Number(src.minVariance))) out.minVariance = clamp(Number(src.minVariance), 90, 360);
+  if (src.centerY != null && !Number.isNaN(Number(src.centerY))) out.centerY = clamp(Number(src.centerY), 0.48, 0.66);
+  if (src.heightRatio != null && !Number.isNaN(Number(src.heightRatio))) out.heightRatio = clamp(Number(src.heightRatio), 0.22, 0.38);
+  if (src.widthRatio != null && !Number.isNaN(Number(src.widthRatio))) out.widthRatio = clamp(Number(src.widthRatio), 0.86, 0.99);
+  return out;
+}
+
+function saveCameraTuningOverrides() {
+  cameraTuningOverrides = normalizeCameraTuningOverrides(cameraTuningOverrides);
+  localStorage.setItem('nab_camera_tuning_overrides', JSON.stringify(cameraTuningOverrides));
+}
+
+function renderAdvancedTuningPanel() {
+  const normalized = normalizeCameraTuningOverrides(cameraTuningOverrides);
+  cameraTuningOverrides = normalized;
+  const setVal = (id, val) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = val;
+  };
+  const setRange = (id, val) => {
+    const el = document.getElementById(id);
+    if (el && !Number.isNaN(Number(val))) el.value = String(val);
+  };
+  setRange('tuneMinLight', normalized.minLight ?? 45);
+  setRange('tuneMinEdge', Math.round((normalized.minEdge ?? 0.042) * 1000));
+  setRange('tuneMinVariance', normalized.minVariance ?? 170);
+  setRange('tuneCenterY', Math.round((normalized.centerY ?? 0.56) * 100));
+  setRange('tuneHeightRatio', Math.round((normalized.heightRatio ?? 0.30) * 100));
+  setRange('tuneWidthRatio', Math.round((normalized.widthRatio ?? 0.94) * 100));
+  setVal('tuneMinLightVal', `${Math.round(normalized.minLight ?? 45)}`);
+  setVal('tuneMinEdgeVal', `${(normalized.minEdge ?? 0.042).toFixed(3)}`);
+  setVal('tuneMinVarianceVal', `${Math.round(normalized.minVariance ?? 170)}`);
+  setVal('tuneCenterYVal', `${Math.round((normalized.centerY ?? 0.56) * 100)}%`);
+  setVal('tuneHeightRatioVal', `${Math.round((normalized.heightRatio ?? 0.30) * 100)}%`);
+  setVal('tuneWidthRatioVal', `${Math.round((normalized.widthRatio ?? 0.94) * 100)}%`);
+}
+
+function getDeviceCameraClass() {
+  const ua = navigator.userAgent || '';
+  if (/iPhone|iPad|iPod/i.test(ua)) return 'iphone';
+  if (/Android/i.test(ua)) return 'android';
+  return 'desktop';
+}
+
+function getActiveCameraTuningProfile() {
+  if (cameraTuningProfile !== 'auto') return cameraTuningProfile;
+  return getDeviceCameraClass();
+}
+
+function getCameraTuningConfig() {
+  const profile = getActiveCameraTuningProfile();
+  const overrides = normalizeCameraTuningOverrides(cameraTuningOverrides);
+  let base;
+  if (profile === 'iphone') {
+    base = { widthRatio: 0.96, heightRatio: 0.29, centerY: 0.56, qualityWidth: 1500, minLight: 40, minEdge: 0.036, minVariance: 150 };
+  } else if (profile === 'android') {
+    base = { widthRatio: 0.93, heightRatio: 0.31, centerY: 0.57, qualityWidth: 1500, minLight: 48, minEdge: 0.045, minVariance: 188 };
+  } else if (profile === 'aggressive') {
+    base = { widthRatio: 0.92, heightRatio: 0.34, centerY: 0.56, qualityWidth: 1700, minLight: 52, minEdge: 0.052, minVariance: 220 };
+  } else {
+    base = { widthRatio: 0.94, heightRatio: 0.30, centerY: 0.56, qualityWidth: 1500, minLight: 45, minEdge: 0.042, minVariance: 170 };
+  }
+  return { ...base, ...overrides };
+}
+
 function collectUserSettings() {
   return {
     active_function: activeFunction,
     serial_profile: serialProfile,
     camera_pref: cameraPreference,
+    camera_tuning_profile: cameraTuningProfile,
+    camera_tuning_overrides: normalizeCameraTuningOverrides(cameraTuningOverrides),
     autosave_pref: autosavePref,
+    auto_scan_start: autoScanStartPref,
     selected_box_id: selectedBoxId || '',
   };
 }
@@ -2905,9 +3110,21 @@ function applyServerSettings(payload, opts = {}) {
     cameraPreference = s.camera_pref.trim();
     localStorage.setItem('nab_camera_pref', cameraPreference);
   }
+  if (typeof s.camera_tuning_profile === 'string' && s.camera_tuning_profile.trim()) {
+    cameraTuningProfile = normalizeCameraTuningProfile(s.camera_tuning_profile);
+    localStorage.setItem('nab_camera_tuning_profile', cameraTuningProfile);
+  }
+  if (s.camera_tuning_overrides && typeof s.camera_tuning_overrides === 'object') {
+    cameraTuningOverrides = normalizeCameraTuningOverrides(s.camera_tuning_overrides);
+    saveCameraTuningOverrides();
+  }
   if (s.autosave_pref === '0' || s.autosave_pref === '1') {
     autosavePref = s.autosave_pref;
     localStorage.setItem('nab_autosave_pref', autosavePref);
+  }
+  if (s.auto_scan_start === '0' || s.auto_scan_start === '1') {
+    autoScanStartPref = s.auto_scan_start;
+    localStorage.setItem('nab_auto_scan_start', autoScanStartPref);
   }
   if (typeof s.selected_box_id === 'string') {
     saveSelectedBox(s.selected_box_id);
@@ -2918,6 +3135,7 @@ function applyServerSettings(payload, opts = {}) {
     applyCameraPreferenceToUI();
     renderBoxes();
     renderQueue();
+    renderAdvancedTuningPanel();
   }
   updateModePill();
   if (!opts.skipToast) {
@@ -2926,6 +3144,9 @@ function applyServerSettings(payload, opts = {}) {
   if (isScanning && !opts.skipRender && cameraPreference !== prevCameraPref) {
     // Apply restored camera preference on active scanner with a safe restart.
     stopScanner().then(() => setTimeout(startScanner, 220));
+  }
+  if (!opts.skipRender) {
+    maybeAutoStartScanner('settings');
   }
 }
 
@@ -3210,6 +3431,58 @@ function onAutosaveChange() {
   if (settingsAppliedFromServer) scheduleUserSettingsSync();
 }
 
+function onAutoScanStartChange() {
+  const cb = document.getElementById('autoScanStart');
+  autoScanStartPref = (cb && cb.checked) ? '1' : '0';
+  localStorage.setItem('nab_auto_scan_start', autoScanStartPref);
+  if (settingsAppliedFromServer) scheduleUserSettingsSync();
+  if (autoScanStartPref === '1') maybeAutoStartScanner('toggle');
+}
+
+function onCameraTuningProfileChange() {
+  const sel = document.getElementById('cameraTuningSel');
+  cameraTuningProfile = normalizeCameraTuningProfile(sel ? sel.value : cameraTuningProfile);
+  localStorage.setItem('nab_camera_tuning_profile', cameraTuningProfile);
+  const active = getActiveCameraTuningProfile();
+  setGuideChip(`🎛 Tuning: ${active}`, 'guide');
+  renderAdvancedTuningPanel();
+  if (settingsAppliedFromServer) scheduleUserSettingsSync();
+}
+
+function onTuningOverrideInput(key, rawValue) {
+  const num = Number(rawValue);
+  if (Number.isNaN(num)) return;
+  if (key === 'minEdge') cameraTuningOverrides[key] = num / 1000;
+  else if (key === 'centerY' || key === 'heightRatio' || key === 'widthRatio') cameraTuningOverrides[key] = num / 100;
+  else cameraTuningOverrides[key] = num;
+  saveCameraTuningOverrides();
+  renderAdvancedTuningPanel();
+  setGuideChip(`🎛 Tuning: ${getActiveCameraTuningProfile()}`, 'guide');
+  if (settingsAppliedFromServer) scheduleUserSettingsSync();
+}
+
+function resetTuningOverrides() {
+  cameraTuningOverrides = {};
+  saveCameraTuningOverrides();
+  renderAdvancedTuningPanel();
+  setGuideChip(`🎛 Tuning: ${getActiveCameraTuningProfile()}`, 'guide');
+  if (settingsAppliedFromServer) scheduleUserSettingsSync();
+  toast('Advanced tuning reset');
+}
+
+function maybeAutoStartScanner(reason = 'auto') {
+  if (autoScanStartPref !== '1') return;
+  if (isScanning || !appBootstrapped || !isUserAuthenticated) return;
+  if (photoProcessing || photoSendPending || ocrAwaitingServer) return;
+  if (document.visibilityState === 'hidden') return;
+  if (typeof Html5Qrcode === 'undefined') return;
+  if (!isSecureCameraContext()) return;
+  setTimeout(() => {
+    if (isScanning || !isUserAuthenticated || autoScanStartPref !== '1') return;
+    startScanner();
+  }, reason === 'connect' ? 220 : 120);
+}
+
 function startImportLive() {
   setFunctionMode('import');
   if (!isScanning) startScanner();
@@ -3237,6 +3510,7 @@ function updateFunctionModeUI() {
   const photoBtn = document.getElementById('photoBtn');
   const importActions = document.getElementById('importActions');
   const autosaveCb = document.getElementById('autosave');
+  const cameraTuningSel = document.getElementById('cameraTuningSel');
 
   const mode = activeFunction;
   if (invBtn) invBtn.classList.toggle('active', mode === 'inventory');
@@ -3280,12 +3554,17 @@ function updateFunctionModeUI() {
     autosaveCb.disabled = mode !== 'inventory';
     if (mode === 'inventory') autosaveCb.checked = autosavePref !== '0';
   }
+  const autoScanCb = document.getElementById('autoScanStart');
+  if (autoScanCb) autoScanCb.checked = autoScanStartPref !== '0';
+  if (cameraTuningSel) cameraTuningSel.value = normalizeCameraTuningProfile(cameraTuningProfile);
+  renderAdvancedTuningPanel();
   
   if (mode !== 'import') {
     if (sock) sock.emit('get_boxes');
   }
   updateModePill();
   updateCaptureControls();
+  maybeAutoStartScanner('mode');
 }
 
 function renderQueue() {
@@ -3485,16 +3764,21 @@ function drawOcrCropToCanvas(video, canvas, opts = {}) {
       const img = tctx.getImageData(0, 0, outW, outH);
       const data = img.data;
       const rowScore = new Float32Array(outH);
+      const colScore = new Float32Array(outW);
       for (let y = 0; y < outH - 1; y++) {
         let score = 0;
         for (let x = 0; x < outW - 1; x += 2) {
           const i = (y * outW + x) * 4;
           const j = ((y + 1) * outW + x) * 4;
+          const k = (y * outW + (x + 1)) * 4;
           const r = data[i], g = data[i + 1], b = data[i + 2];
           const r2 = data[j], g2 = data[j + 1], b2 = data[j + 2];
+          const rx = data[k], gx = data[k + 1], bx = data[k + 2];
           const l1 = 0.299 * r + 0.587 * g + 0.114 * b;
           const l2 = 0.299 * r2 + 0.587 * g2 + 0.114 * b2;
+          const lx = 0.299 * rx + 0.587 * gx + 0.114 * bx;
           score += Math.abs(l1 - l2);
+          colScore[x] += Math.abs(l1 - lx);
         }
         rowScore[y] = score;
       }
@@ -3511,9 +3795,19 @@ function drawOcrCropToCanvas(video, canvas, opts = {}) {
           bestY = y;
         }
       }
+      let bestX = Math.floor(outW / 2);
+      let bestCol = -1;
+      for (let x = Math.floor(outW * 0.12); x < Math.floor(outW * 0.88); x++) {
+        if (colScore[x] > bestCol) {
+          bestCol = colScore[x];
+          bestX = x;
+        }
+      }
       const bandH = Math.max(Math.floor(outH * 0.62), 56);
+      const bandW = Math.max(Math.floor(outW * 0.88), 180);
       const top = Math.max(0, Math.min(outH - bandH, Math.floor(bestY - bandH / 2)));
-      ctx.drawImage(temp, 0, top, outW, bandH, 0, 0, outW, outH);
+      const left = Math.max(0, Math.min(outW - bandW, Math.floor(bestX - bandW / 2)));
+      ctx.drawImage(temp, left, top, bandW, bandH, 0, 0, outW, outH);
     } catch (e) {
       ctx.drawImage(temp, 0, 0, outW, outH);
     }
@@ -3534,6 +3828,10 @@ function drawOcrCropToCanvas(video, canvas, opts = {}) {
 }
 
 function evaluateFrameQuality(canvas) {
+  const tune = getCameraTuningConfig();
+  const minLight = typeof tune.minLight === 'number' ? tune.minLight : 45;
+  const minEdge = typeof tune.minEdge === 'number' ? tune.minEdge : 0.042;
+  const minVariance = typeof tune.minVariance === 'number' ? tune.minVariance : 170;
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
   if (!ctx) return { ok: false, reason: 'camera_read_fail' };
   const w = canvas.width || 0;
@@ -3571,9 +3869,9 @@ function evaluateFrameQuality(canvas) {
   const variance = Math.max(0, (sum2 / samples) - (mean * mean));
   const edgeDensity = edgeHits / samples;
 
-  if (mean < 45) return { ok: false, reason: 'too_dark', mean, variance, edgeDensity };
-  if (edgeDensity < 0.042) return { ok: false, reason: 'no_label', mean, variance, edgeDensity };
-  if (variance < 170) return { ok: false, reason: 'too_blurry', mean, variance, edgeDensity };
+  if (mean < minLight) return { ok: false, reason: 'too_dark', mean, variance, edgeDensity };
+  if (edgeDensity < minEdge) return { ok: false, reason: 'no_label', mean, variance, edgeDensity };
+  if (variance < minVariance) return { ok: false, reason: 'too_blurry', mean, variance, edgeDensity };
   return { ok: true, mean, variance, edgeDensity };
 }
 
@@ -3584,6 +3882,14 @@ function frameQualityHint(result) {
   if (reason === 'no_label') return { text: '📦 Center serial label in frame', level: 'warn' };
   if (reason === 'camera_read_fail') return { text: '📷 Camera stream unstable', level: 'warn' };
   return { text: '✅ Label looks good', level: 'ok' };
+}
+
+function frameQualityScore(result) {
+  if (!result || !result.ok) return 0;
+  const variance = Math.min(1, Math.max(0, (result.variance || 0) / 520));
+  const edge = Math.min(1, Math.max(0, (result.edgeDensity || 0) / 0.12));
+  const light = Math.min(1, Math.max(0, ((result.mean || 0) - 48) / 110));
+  return (variance * 0.45) + (edge * 0.4) + (light * 0.15);
 }
 
 function getUserColor(name) {
@@ -3678,6 +3984,7 @@ function initSocket() {
     setAuthPill(isUserAuthenticated ? 'ok' : 'session');
     setSettingsPill('ok');
     updateCaptureControls();
+    if (isUserAuthenticated) maybeAutoStartScanner('identity');
     if (isUserAuthenticated) hideAllIdentityModals();
     else showAuthChoiceModal();
   });
@@ -3709,6 +4016,7 @@ function initSocket() {
     sock.emit('get_boxes');
     flushPendingSocketEmits();
     updateCaptureControls();
+    maybeAutoStartScanner('session');
   });
 
   sock.on('user_settings', (data) => {
@@ -3786,6 +4094,7 @@ function initSocket() {
     if (isScanning) queueNextOcr(140);
     if (isUserAuthenticated) flushPendingSocketEmits();
     updateCaptureControls();
+    maybeAutoStartScanner('connect');
   });
 
   sock.on('connect_error', (err) => {
@@ -4241,23 +4550,36 @@ async function doOcrFrame() {
 
   ocrRunning = true;
   try {
+    const tune = getCameraTuningConfig();
     const canvas = document.createElement('canvas');
     drawOcrCropToCanvas(video, canvas, {
-      widthRatio: 0.94,
-      heightRatio: 0.30,
-      centerY: 0.56,
-      qualityWidth: liveCaptureWidth
+      widthRatio: tune.widthRatio,
+      heightRatio: tune.heightRatio,
+      centerY: tune.centerY,
+      qualityWidth: Math.max(1000, Math.min(1800, Math.round((tune.qualityWidth || liveCaptureWidth) * (liveCaptureWidth / 1500))))
     });
     const quality = evaluateFrameQuality(canvas);
     if (!quality.ok) {
+      goodFrameStreak = 0;
+      badFrameStreak += 1;
       const hint = frameQualityHint(quality);
       setGuideChip(hint.text, hint.level);
-      if (quality.reason === 'too_blurry' || quality.reason === 'no_label') {
+      if (quality.reason === 'too_blurry' || quality.reason === 'no_label' || badFrameStreak >= 3) {
         refocusCamera(true);
       }
       setProcessingState('live', true, hint.text.replace(/^.. /, ''));
       ocrRunning = false;
       queueNextOcr(Math.max(180, Math.min(ocrDelayMs, 320)));
+      return;
+    }
+    badFrameStreak = 0;
+    goodFrameStreak += 1;
+    const qualityScore = frameQualityScore(quality);
+    if (goodFrameStreak < 2 && qualityScore < 0.72) {
+      setGuideChip('🎯 Hold steady for stable capture', 'guide');
+      setProcessingState('live', true, 'stabilizing frame');
+      ocrRunning = false;
+      queueNextOcr(Math.max(170, Math.min(ocrDelayMs, 260)));
       return;
     }
     setGuideChip('✅ Label stable', 'ok');
@@ -4323,12 +4645,13 @@ async function capturePhoto() {
       return;
     }
 
+    const tune = getCameraTuningConfig();
     const canvas = document.createElement('canvas');
     drawOcrCropToCanvas(video, canvas, {
-      widthRatio: 0.96,
-      heightRatio: 0.24,
-      centerY: 0.54,
-      qualityWidth: 1700
+      widthRatio: Math.min(0.98, (tune.widthRatio || 0.94) + 0.02),
+      heightRatio: Math.max(0.24, (tune.heightRatio || 0.30) - 0.02),
+      centerY: Math.max(0.5, (tune.centerY || 0.56) - 0.01),
+      qualityWidth: Math.max(1450, (tune.qualityWidth || 1500) + 160)
     });
     const quality = evaluateFrameQuality(canvas);
     if (!quality.ok) {
@@ -4549,6 +4872,8 @@ function startScanner() {
     (decoded) => onScan(decoded, { confidence: 1, source: 'barcode' }), ()=>{}
   ).then(() => {
     isScanning = true;
+    goodFrameStreak = 0;
+    badFrameStreak = 0;
     hideScanHold();
     ocrAwaitingServer = false;
     stopPhotoOnlyStream();
@@ -4577,6 +4902,8 @@ function stopScanner() {
     if (scanner && isScanning) {
       scanner.stop().then(() => {
         isScanning = false;
+        goodFrameStreak = 0;
+        badFrameStreak = 0;
         if (sock) sock.emit('scanner_state', { scanning: false, serial_profile: serialProfile });
         const sBtn = document.getElementById('startBtn');
         sBtn.classList.add('btn-pulse');
@@ -4584,11 +4911,15 @@ function stopScanner() {
         r();
       }).catch(() => {
         isScanning = false;
+        goodFrameStreak = 0;
+        badFrameStreak = 0;
         if (sock) sock.emit('scanner_state', { scanning: false, serial_profile: serialProfile });
         updateCaptureControls();
         r();
       });
     } else {
+      goodFrameStreak = 0;
+      badFrameStreak = 0;
       updateCaptureControls();
       stopPhotoOnlyStream();
       r();
@@ -5450,6 +5781,7 @@ async function bootstrapApp() {
   }
   updateFunctionModeUI();
   renderQueue();
+  maybeAutoStartScanner('bootstrap');
   setInterval(() => { loadCheckset(); }, 30000);
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') {
@@ -5490,6 +5822,7 @@ async function bootstrapApp() {
 function init() {
   loadJoinPinCache();
   loadSelectedBoxCache();
+  saveCameraTuningOverrides();
   if (!sessionToken) {
     const st = (localStorage.getItem('nab_session_token') || '').trim();
     if (st) sessionToken = st;
@@ -5497,6 +5830,8 @@ function init() {
   setSettingsPill('local');
   setAuthPill((joinPin || sessionToken) ? 'session' : 'required');
   updateModePill();
+  setGuideChip(`🎛 Tuning: ${getActiveCameraTuningProfile()}`, 'guide');
+  renderAdvancedTuningPanel();
   updateCaptureControls();
   if (joinPin || sessionToken) {
     bootstrapApp();
@@ -5653,7 +5988,7 @@ def add_serial_to_checklist(serial, approved=False, confidence=0.0, manual=False
 
 @app.route("/")
 def index():
-    return LEGACY_INDEX_HTML
+    return LEGACY_INDEX_HTML.replace("__APP_BUILD_ID__", APP_BUILD_ID)
 
 
 @app.after_request
