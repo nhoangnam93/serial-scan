@@ -1,0 +1,51 @@
+{
+  "1775462814415": {
+    "id": "1775462814415",
+    "name": "A",
+    "target": [],
+    "scanned": [
+      "C02H80P8Q05P",
+      "C02GP0RXQ05P"
+    ],
+    "user": "Max",
+    "last_active": "2026-04-06 16:53:20",
+    "closed": false,
+    "audit": [
+      {
+        "serial": "C02H80P8Q05P",
+        "user": "Max",
+        "method": "camera",
+        "lane": "General",
+        "timestamp": "2026-04-06 15:38:09",
+        "in_target": false,
+        "duplicate_in_box": false,
+        "sid": "LZuBILd77GuyRCxsAAAT",
+        "ip": "10.242.24.98"
+      },
+      {
+        "serial": "C02GP0RXQ05P",
+        "user": "Max",
+        "method": "camera",
+        "lane": "General",
+        "timestamp": "2026-04-06 16:41:13",
+        "in_target": false,
+        "duplicate_in_box": false,
+        "sid": "Njl1fcFa00OW8ErVAAAN",
+        "ip": "10.242.24.98"
+      },
+      {
+        "serial": "C02GP0RXQ05P",
+        "user": "Max",
+        "method": "camera",
+        "lane": "General",
+        "timestamp": "2026-04-06 16:53:20",
+        "in_target": false,
+        "duplicate_in_box": true,
+        "sid": "XzcUyZsdtrMAqiu6AAAT",
+        "ip": "10.242.24.98",
+        "crop_file": "C02GP0RXQ05P__20260406_165320_000.jpg",
+        "crop_latest_file": "C02GP0RXQ05P.jpg"
+      }
+    ]
+  }
+}
