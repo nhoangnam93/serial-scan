@@ -186,12 +186,24 @@ def extract_serial_from_text(text, profile="apple"):
     if profile == "dell":
         # Strong Dell hints first: "Service Tag", "Svc Tag", "ST:"
         st_match = re.search(
-            r"(?:SERVICE\s*TAG|SVC\s*TAG|SVCTAG|ST)\s*[:#-]?\s*([A-Z0-9]{7,12})",
+            r"(?:SERVICE\s*TAG|SVC\s*TAG|SVCTAG|ST)\s*[:#-]\s*([A-Z0-9]{7,12})",
             upper_cleaned,
             re.IGNORECASE,
         )
         if st_match:
             candidate = normalize_serial_candidate(st_match.group(1), "dell")
+            if len(candidate) > DELL_SERVICE_TAG_LENGTH:
+                candidate = candidate[:DELL_SERVICE_TAG_LENGTH]
+            if is_valid_serial_candidate_for_profile(candidate, "dell"):
+                return candidate
+
+        st_match_soft = re.search(
+            r"(?:SERVICE\s*TAG|SVC\s*TAG|SVCTAG)\s*([A-Z0-9]{7,12})",
+            upper_cleaned,
+            re.IGNORECASE,
+        )
+        if st_match_soft:
+            candidate = normalize_serial_candidate(st_match_soft.group(1), "dell")
             if len(candidate) > DELL_SERVICE_TAG_LENGTH:
                 candidate = candidate[:DELL_SERVICE_TAG_LENGTH]
             if is_valid_serial_candidate_for_profile(candidate, "dell"):

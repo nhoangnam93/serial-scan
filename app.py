@@ -14,18 +14,22 @@ import csv
 import json
 import socket
 import base64
+import hashlib
+import hmac
 import logging
 import platform
 import re
+import secrets
 import sys
 import threading
 import time
 import webbrowser
 import io
+import tempfile
 from collections import deque
 from datetime import datetime
 from io import StringIO, BytesIO
-from flask import Flask, request, render_template, jsonify, send_file, Response
+from flask import Flask, request, jsonify, send_file, Response
 from flask_socketio import SocketIO, emit, join_room, leave_room
 from src.vision import recognize_text_from_binary
 from serial_parser import (
@@ -370,8 +374,8 @@ def process_single_image_for_sid(sid, img_data, source="live_photo", serial_prof
     broadcast_ocr_dashboard()
 
 app = Flask(__name__)
-app.config["SECRET_KEY"] = "nab-serial-scanner-2026"
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
+socketio = SocketIO(app, async_mode="eventlet")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CSV_FILE = os.path.join(BASE_DIR, "serial_numbers.csv")
@@ -391,7 +395,13 @@ STRICT_MACBOOK_ONLY = os.environ.get("STRICT_MACBOOK_ONLY", "1").lower() in {"1"
 DEFAULT_SERIAL_PROFILE = normalize_serial_profile(os.environ.get("DEFAULT_SERIAL_PROFILE", "apple"))
 JOIN_PIN = os.environ.get("JOIN_PIN", "2026")
 USERS_FILE = os.path.join(BASE_DIR, "users.json")
-user_registry = {}  # client_id -> {name, pin}
+user_registry = {}  # client_id -> {name, pin_hash}
+MAX_OCR_IMAGE_DATA_URL_CHARS = int(os.environ.get("MAX_OCR_IMAGE_DATA_URL_CHARS", "7000000"))
+MAX_CROP_BYTES = int(os.environ.get("MAX_CROP_BYTES", "6000000"))
+PIN_MIN_LEN = int(os.environ.get("PIN_MIN_LEN", "4"))
+PIN_MAX_LEN = int(os.environ.get("PIN_MAX_LEN", "16"))
+PIN_HASH_PREFIX = "scrypt$"
+DATA_FILE_MODE = 0o600
 
 # Track connected users: sid -> {name, ip, connected_at}
 connected_users = {}
@@ -421,6 +431,69 @@ BOXES_FILE = os.path.join(BASE_DIR, "boxes.json")
 box_registry = {}  # box_id -> {name, target: [], scanned: [], user, last_active}
 box_live_presence = {}  # box_id -> {sid -> member}
 sid_box_membership = {}  # sid -> box_id
+data_lock = threading.Lock()
+
+
+def secure_chmod(path, mode=DATA_FILE_MODE):
+    try:
+        os.chmod(path, mode)
+    except Exception:
+        pass
+
+
+def atomic_write_json(path, payload):
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp-", dir=directory, text=True)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(payload, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+        secure_chmod(path)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
+def is_reasonable_pin(pin):
+    p = str(pin or "").strip()
+    return PIN_MIN_LEN <= len(p) <= PIN_MAX_LEN
+
+
+def hash_pin(pin, salt=None):
+    if salt is None:
+        salt = secrets.token_bytes(16)
+    if isinstance(salt, str):
+        salt = bytes.fromhex(salt)
+    key = hashlib.scrypt(str(pin).encode("utf-8"), salt=salt, n=2**14, r=8, p=1, dklen=32)
+    return f"{PIN_HASH_PREFIX}16384$8$1${salt.hex()}${key.hex()}"
+
+
+def verify_pin(pin, stored):
+    raw = str(stored or "").strip()
+    if not raw:
+        return False
+    # Backward compatibility with old plaintext pin records.
+    if not raw.startswith(PIN_HASH_PREFIX):
+        return hmac.compare_digest(str(pin or "").strip(), raw)
+    try:
+        _, n_s, r_s, p_s, salt_hex, key_hex = raw.split("$", 5)
+        key = hashlib.scrypt(
+            str(pin or "").encode("utf-8"),
+            salt=bytes.fromhex(salt_hex),
+            n=int(n_s),
+            r=int(r_s),
+            p=int(p_s),
+            dklen=len(bytes.fromhex(key_hex)),
+        )
+        return hmac.compare_digest(key.hex(), key_hex)
+    except Exception:
+        return False
 
 
 def ensure_crop_storage():
@@ -433,6 +506,8 @@ def ensure_crop_storage():
 def decode_data_url_image(data_url):
     if not data_url or not isinstance(data_url, str):
         return None, None
+    if len(data_url) > MAX_OCR_IMAGE_DATA_URL_CHARS:
+        return None, None
     if "," not in data_url:
         return None, None
     header, b64 = data_url.split(",", 1)
@@ -444,7 +519,10 @@ def decode_data_url_image(data_url):
     elif "image/jpeg" in header or "image/jpg" in header:
         ext = "jpg"
     try:
-        return base64.b64decode(b64), ext
+        payload = base64.b64decode(b64, validate=True)
+        if not payload or len(payload) > MAX_CROP_BYTES:
+            return None, None
+        return payload, ext
     except Exception:
         return None, None
 
@@ -472,22 +550,26 @@ def save_crop_image(serial, crop_data_url, confidence=0.0, user="Anonymous", met
     unique_path = os.path.join(CROPS_DIR, unique_name)
     latest_path = os.path.join(CROPS_DIR, latest_name)
 
-    with open(unique_path, "wb") as f:
-        f.write(payload)
-    with open(latest_path, "wb") as f:
-        f.write(payload)
+    with data_lock:
+        with open(unique_path, "wb") as f:
+            f.write(payload)
+        with open(latest_path, "wb") as f:
+            f.write(payload)
+        secure_chmod(unique_path)
+        secure_chmod(latest_path)
 
-    with open(CROPS_MANIFEST_FILE, "a", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            (timestamp_str or datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-            serial_safe,
-            f"{float(confidence or 0.0):.4f}",
-            (user or "Anonymous"),
-            (method or "camera"),
-            unique_name,
-            latest_name,
-        ])
+        with open(CROPS_MANIFEST_FILE, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                (timestamp_str or datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                serial_safe,
+                f"{float(confidence or 0.0):.4f}",
+                (user or "Anonymous"),
+                (method or "camera"),
+                unique_name,
+                latest_name,
+            ])
+        secure_chmod(CROPS_MANIFEST_FILE)
 
     return {
         "serial": serial_safe,
@@ -521,6 +603,7 @@ def load_box_registry():
     try:
         with open(BOXES_FILE, "r") as f:
             box_registry = json.load(f)
+        secure_chmod(BOXES_FILE)
     except Exception as e:
         print(f"-> Error loading box registry: {e}")
         box_registry = {}
@@ -529,8 +612,8 @@ def load_box_registry():
 
 def save_box_registry():
     try:
-        with open(BOXES_FILE, "w") as f:
-            json.dump(box_registry, f, indent=2)
+        with data_lock:
+            atomic_write_json(BOXES_FILE, box_registry)
     except Exception as e:
         print(f"-> Error saving box registry: {e}")
 
@@ -543,17 +626,39 @@ def load_user_registry():
     try:
         with open(USERS_FILE, "r") as f:
             user_registry = json.load(f)
+        secure_chmod(USERS_FILE)
     except Exception as e:
         print(f"-> Error loading user registry: {e}")
         user_registry = {}
+    migrated = False
+    for cid, profile in list((user_registry or {}).items()):
+        if not isinstance(profile, dict):
+            user_registry.pop(cid, None)
+            migrated = True
+            continue
+        plain_pin = str(profile.get("pin", "")).strip()
+        pin_hash = str(profile.get("pin_hash", "")).strip()
+        if plain_pin and not pin_hash:
+            profile["pin_hash"] = hash_pin(plain_pin)
+            profile.pop("pin", None)
+            migrated = True
+        elif pin_hash and profile.get("pin"):
+            profile.pop("pin", None)
+            migrated = True
+    if migrated:
+        try:
+            with data_lock:
+                atomic_write_json(USERS_FILE, user_registry)
+        except Exception as e:
+            print(f"-> Error migrating user registry pins: {e}")
 
 
 def save_user_to_registry(client_id, name, pin):
     global user_registry
-    user_registry[client_id] = {"name": name, "pin": str(pin)}
+    user_registry[client_id] = {"name": name, "pin_hash": hash_pin(str(pin or "").strip())}
     try:
-        with open(USERS_FILE, "w") as f:
-            json.dump(user_registry, f, indent=2)
+        with data_lock:
+            atomic_write_json(USERS_FILE, user_registry)
     except Exception as e:
         print(f"-> Error saving user registry: {e}")
 
@@ -565,7 +670,7 @@ def find_user_by_pin(pin, exclude_client_id=None):
     for cid, profile in (user_registry or {}).items():
         if exclude_client_id and cid == exclude_client_id:
             continue
-        if str((profile or {}).get("pin", "")).strip() == target:
+        if verify_pin(target, (profile or {}).get("pin_hash") or (profile or {}).get("pin")):
             return cid, profile
     return None, None
 
@@ -580,6 +685,7 @@ def box_room_name(box_id):
 
 def normalize_box_record(box_id, raw):
     data = raw if isinstance(raw, dict) else {}
+    box_profile = normalize_serial_profile(data.get("serial_profile", DEFAULT_SERIAL_PROFILE))
     target_raw = data.get("target") or []
     scanned_raw = data.get("scanned") or []
     audit_raw = data.get("audit") or []
@@ -587,7 +693,7 @@ def normalize_box_record(box_id, raw):
     target = []
     seen_target = set()
     for item in target_raw:
-        serial = normalize_serial_candidate(item)
+        serial = normalize_serial_candidate(item, box_profile)
         if serial and serial not in seen_target:
             seen_target.add(serial)
             target.append(serial)
@@ -595,7 +701,7 @@ def normalize_box_record(box_id, raw):
     scanned = []
     seen_scanned = set()
     for item in scanned_raw:
-        serial = normalize_serial_candidate(item)
+        serial = normalize_serial_candidate(item, box_profile)
         if serial and serial not in seen_scanned:
             seen_scanned.add(serial)
             scanned.append(serial)
@@ -605,11 +711,12 @@ def normalize_box_record(box_id, raw):
         for row in audit_raw[-1200:]:
             if not isinstance(row, dict):
                 continue
-            serial = normalize_serial_candidate(row.get("serial"))
+            serial = normalize_serial_candidate(row.get("serial"), box_profile)
             if not serial:
                 continue
             audit.append({
                 "serial": serial,
+                "serial_profile": normalize_serial_profile(row.get("serial_profile", box_profile)),
                 "user": (row.get("user") or "Anonymous")[:48],
                 "method": (row.get("method") or "camera")[:16],
                 "lane": normalize_lane_name(row.get("lane")),
@@ -623,6 +730,7 @@ def normalize_box_record(box_id, raw):
     return {
         "id": str(box_id),
         "name": (data.get("name") or f"Box {box_id}")[:64],
+        "serial_profile": box_profile,
         "target": target,
         "scanned": scanned,
         "user": (data.get("user") or "Anon")[:48],
@@ -671,6 +779,7 @@ def box_payload_for(sid=None):
         reverse=True,
     ):
         box = box_registry[box_id]
+        box_profile = normalize_serial_profile(box.get("serial_profile", DEFAULT_SERIAL_PROFILE))
         target = box.get("target") or []
         scanned = box.get("scanned") or []
         progress = int((len(scanned) / len(target)) * 100) if target else 0
@@ -683,10 +792,12 @@ def box_payload_for(sid=None):
             "user": box.get("user", "Anon"),
             "last_active": box.get("last_active", ""),
             "closed": bool(box.get("closed")),
+            "serial_profile": box_profile,
             "audit_count": len(box.get("audit") or []),
             "recent_scans": [
                 {
-                    "serial": normalize_serial_candidate(row.get("serial")),
+                    "serial": normalize_serial_candidate(row.get("serial"), box_profile),
+                    "serial_profile": normalize_serial_profile(row.get("serial_profile", box_profile)),
                     "timestamp": row.get("timestamp") or "",
                     "user": row.get("user") or "Anonymous",
                     "method": row.get("method") or "camera",
@@ -696,7 +807,7 @@ def box_payload_for(sid=None):
                     "crop_latest_file": (row.get("crop_latest_file") or ""),
                 }
                 for row in (box.get("audit") or [])[-400:]
-                if normalize_serial_candidate(row.get("serial"))
+                if normalize_serial_candidate(row.get("serial"), box_profile)
             ],
             "progress_pct": progress,
             "active_users": len(collaborators),
@@ -2556,6 +2667,10 @@ function initSocket() {
       showNameModal();
       return;
     }
+    if (reason === 'rate_limit') {
+      toast('Too many attempts. Wait 1 minute and try again.');
+      return;
+    }
     toast('Authentication failed.');
     showAuthChoiceModal();
   });
@@ -3458,7 +3573,7 @@ function closeBoxCreate() {
 function submitBoxCreate() {
   const name = document.getElementById('boxNameInput').value.trim();
   if (!name) return;
-  sock.emit('box_create', { name });
+  sock.emit('box_create', { name, serial_profile: serialProfile });
   closeBoxCreate();
 }
 
@@ -3985,13 +4100,15 @@ def read_csv_rows():
 
 
 def write_csv_rows(rows):
-    with open(CSV_FILE, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(CSV_HEADERS)
-        for r in rows:
-            w.writerow([r.get("Timestamp",""), r.get("Hostname",""),
-                        r.get("Serial Number",""), r.get("Scanned By",""),
-                        r.get("User",""), r.get("Lane","General")])
+    with data_lock:
+        with open(CSV_FILE, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(CSV_HEADERS)
+            for r in rows:
+                w.writerow([r.get("Timestamp",""), r.get("Hostname",""),
+                            r.get("Serial Number",""), r.get("Scanned By",""),
+                            r.get("User",""), r.get("Lane","General")])
+        secure_chmod(CSV_FILE)
 
 
 def ensure_csv_schema():
@@ -4038,11 +4155,18 @@ def load_check_serials():
                     raw = re.sub(r"[^A-Z0-9]", "", (cell or "").upper())
                     if raw:
                         loaded_raw.add(raw)
+        secure_chmod(CHECK_FILE)
     except Exception:
         loaded_raw = set()
 
-    apple_set = set(filter(None, [normalize_serial_candidate(v, "apple") for v in loaded_raw]))
-    dell_set = set(filter(None, [normalize_serial_candidate(v, "dell") for v in loaded_raw]))
+    apple_set = set(
+        n for n in (normalize_serial_candidate(v, "apple") for v in loaded_raw)
+        if n and is_valid_serial_candidate_for_profile(n, "apple")
+    )
+    dell_set = set(
+        n for n in (normalize_serial_candidate(v, "dell") for v in loaded_raw)
+        if n and is_valid_serial_candidate_for_profile(n, "dell")
+    )
     check_serials_cache_raw = loaded_raw
     check_serials_cache_by_profile = {"apple": apple_set, "dell": dell_set}
     check_serials_cache = apple_set
@@ -4084,8 +4208,10 @@ def add_serial_to_checklist(serial, approved=False, confidence=0.0, manual=False
         return False, "already_exists"
 
     os.makedirs(os.path.dirname(CHECK_FILE) or ".", exist_ok=True)
-    with open(CHECK_FILE, "a", newline="") as f:
-        f.write(normalized + "\n")
+    with data_lock:
+        with open(CHECK_FILE, "a", newline="") as f:
+            f.write(normalized + "\n")
+        secure_chmod(CHECK_FILE)
 
     # force cache refresh
     global check_serials_mtime
@@ -4100,7 +4226,18 @@ def add_serial_to_checklist(serial, approved=False, confidence=0.0, manual=False
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return LEGACY_INDEX_HTML
+
+
+@app.after_request
+def set_security_headers(resp):
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    # Local scanner UI should never be cached by intermediaries.
+    if request.path == "/" or request.path.startswith("/checkset"):
+        resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.route("/download")
@@ -4197,15 +4334,16 @@ def download_box_summary(box_id):
     box = box_registry.get(box_id)
     if not box:
         return "Box not found", 404
+    box_profile = normalize_serial_profile(box.get("serial_profile", DEFAULT_SERIAL_PROFILE))
 
-    target = [normalize_serial_candidate(s) for s in box.get("target", []) if normalize_serial_candidate(s)]
-    scanned = [normalize_serial_candidate(s) for s in box.get("scanned", []) if normalize_serial_candidate(s)]
+    target = [normalize_serial_candidate(s, box_profile) for s in box.get("target", []) if normalize_serial_candidate(s, box_profile)]
+    scanned = [normalize_serial_candidate(s, box_profile) for s in box.get("scanned", []) if normalize_serial_candidate(s, box_profile)]
     scanned_set = set(scanned)
     target_set = set(target)
 
     latest_by_serial = {}
     for row in box.get("audit", []):
-        serial = normalize_serial_candidate(row.get("serial"))
+        serial = normalize_serial_candidate(row.get("serial"), box_profile)
         if not serial:
             continue
         latest_by_serial[serial] = row
@@ -4334,6 +4472,9 @@ def on_connect(auth=None):
 def on_authenticate_pin(data):
     ip = request.remote_addr or "unknown"
     pin = str(data.get("pin", "")).strip()
+    if not is_reasonable_pin(pin):
+        emit("auth_result", {"success": False, "reason": "invalid_pin"}, to=request.sid)
+        return
     
     if not check_auth_rate_limit(ip):
         emit("auth_result", {"success": False, "reason": "rate_limit"}, to=request.sid)
@@ -4397,20 +4538,31 @@ def on_set_name(data):
 
 @socketio.on("register_user")
 def on_register_user(data):
+    ip = request.remote_addr or "unknown"
+    if not check_auth_rate_limit(ip):
+        emit("auth_error", {"reason": "rate_limit"}, to=request.sid)
+        return
     client_id = data.get("client_id")
     name = data.get("name", "Anonymous").strip()
     pin = str(data.get("pin", "")).strip()
     if not client_id:
         client_id = f"cli-{int(time.time() * 1000)}-{request.sid[:6]}"
     if not name or not pin:
+        record_auth_failure(ip)
         emit("auth_error", {"reason": "missing_fields"}, to=request.sid)
+        return
+    if not is_reasonable_pin(pin):
+        record_auth_failure(ip)
+        emit("auth_error", {"reason": "invalid_pin"}, to=request.sid)
         return
     existing_client_id, _ = find_user_by_pin(pin, exclude_client_id=client_id)
     if existing_client_id:
+        record_auth_failure(ip)
         emit("auth_error", {"reason": "pin_in_use"}, to=request.sid)
         return
     
     save_user_to_registry(client_id, name, pin)
+    record_auth_success(ip)
     if request.sid in connected_users:
         connected_users[request.sid]["name"] = name
         connected_users[request.sid]["verified"] = True
@@ -4426,15 +4578,26 @@ def on_register_user(data):
 
 @socketio.on("login_with_pin")
 def on_login_with_pin(data):
+    ip = request.remote_addr or "unknown"
+    if not check_auth_rate_limit(ip):
+        emit("auth_error", {"reason": "rate_limit"}, to=request.sid)
+        return
     pin = str((data or {}).get("pin", "")).strip()
     if not pin:
+        record_auth_failure(ip)
+        emit("auth_error", {"reason": "invalid_pin"}, to=request.sid)
+        return
+    if not is_reasonable_pin(pin):
+        record_auth_failure(ip)
         emit("auth_error", {"reason": "invalid_pin"}, to=request.sid)
         return
     load_user_registry()
     matched_client_id, matched_profile = find_user_by_pin(pin)
     if not matched_client_id or not matched_profile:
+        record_auth_failure(ip)
         emit("auth_error", {"reason": "invalid_pin"}, to=request.sid)
         return
+    record_auth_success(ip)
     previous_sid = client_session_index.get(matched_client_id)
     if previous_sid and previous_sid != request.sid:
         remove_session(previous_sid)
@@ -4470,13 +4633,21 @@ def on_update_profile(data):
             user_registry[client_id]["name"] = name
             connected_users[request.sid]["name"] = name
         if pin:
+            if not is_reasonable_pin(pin):
+                emit("auth_error", {"reason": "invalid_pin"}, to=request.sid)
+                return
             existing_client_id, _ = find_user_by_pin(pin, exclude_client_id=client_id)
             if existing_client_id:
                 emit("auth_error", {"reason": "pin_in_use"}, to=request.sid)
                 return
-            user_registry[client_id]["pin"] = pin
+            user_registry[client_id]["pin_hash"] = hash_pin(pin)
+            user_registry[client_id].pop("pin", None)
         
-        save_user_to_registry(client_id, user_registry[client_id]["name"], user_registry[client_id]["pin"])
+        try:
+            with data_lock:
+                atomic_write_json(USERS_FILE, user_registry)
+        except Exception as e:
+            print(f"-> Error saving user registry update: {e}")
         emit("identity_status", {
             "verified": True,
             "name": user_registry[client_id]["name"],
@@ -4549,6 +4720,17 @@ def on_process_photo_capture(data):
             status="empty",
             accepted=False,
             next_delay_ms=get_client_ocr_interval_ms(state, 200),
+            source="photo",
+        )
+        broadcast_ocr_dashboard()
+        return
+    if not isinstance(img_data, str) or len(img_data) > MAX_OCR_IMAGE_DATA_URL_CHARS:
+        ocr_metrics["errors"] += 1
+        emit_ocr_policy(
+            request.sid,
+            status="error",
+            accepted=False,
+            next_delay_ms=get_client_ocr_interval_ms(state, 300),
             source="photo",
         )
         broadcast_ocr_dashboard()
@@ -4631,12 +4813,14 @@ def on_save_scan(data):
     existing = read_csv_rows()
     duplicate = any(r.get("Serial Number") == serial for r in existing)
 
-    file_exists = os.path.isfile(CSV_FILE) and os.path.getsize(CSV_FILE) > 0
-    with open(CSV_FILE, "a", newline="") as f:
-        w = csv.writer(f)
-        if not file_exists:
-            w.writerow(CSV_HEADERS)
-        w.writerow([timestamp, hostname, serial, method, user, lane])
+    with data_lock:
+        file_exists = os.path.isfile(CSV_FILE) and os.path.getsize(CSV_FILE) > 0
+        with open(CSV_FILE, "a", newline="") as f:
+            w = csv.writer(f)
+            if not file_exists:
+                w.writerow(CSV_HEADERS)
+            w.writerow([timestamp, hostname, serial, method, user, lane])
+        secure_chmod(CSV_FILE)
 
     if crop_image:
         try:
@@ -4666,6 +4850,7 @@ def on_save_scan(data):
         box["last_active"] = timestamp
         audit.append({
             "serial": serial,
+            "serial_profile": serial_profile,
             "user": user,
             "method": method,
             "lane": lane,
@@ -4807,8 +4992,10 @@ def on_delete_scan(data):
 
 @socketio.on("clear_all")
 def on_clear_all():
-    with open(CSV_FILE, "w", newline="") as f:
-        csv.writer(f).writerow(CSV_HEADERS)
+    with data_lock:
+        with open(CSV_FILE, "w", newline="") as f:
+            csv.writer(f).writerow(CSV_HEADERS)
+        secure_chmod(CSV_FILE)
     sync_lane_state_from_rows([])
     broadcast_queue()
     write_lane_csv_files([])
@@ -4868,9 +5055,11 @@ def on_get_qr_code():
 def on_box_create(data):
     name = (data or {}).get("name", "").strip()
     if not name: return
+    serial_profile = get_sid_serial_profile(request.sid, (data or {}).get("serial_profile"))
     box_id = str(int(time.time() * 1000))
     box_registry[box_id] = normalize_box_record(box_id, {
         "name": name,
+        "serial_profile": serial_profile,
         "target": [],
         "scanned": [],
         "user": connected_users.get(request.sid, {}).get("name", "Anon"),
@@ -5005,6 +5194,13 @@ def handle_ocr_frame(data):
         ocr_metrics["empty_frames"] += 1
         print(f"-> OCR Frame #{frame_counts[sid]} from {sid} dropped: No image data")
         emit_ocr_policy(sid, status="empty", accepted=False, next_delay_ms=get_client_ocr_interval_ms(state, 200))
+        broadcast_ocr_dashboard()
+        return
+    if not isinstance(img_data, str) or len(img_data) > MAX_OCR_IMAGE_DATA_URL_CHARS:
+        state["pending"] = False
+        ocr_inflight = max(0, ocr_inflight - 1)
+        ocr_metrics["errors"] += 1
+        emit_ocr_policy(sid, status="error", accepted=False, next_delay_ms=get_client_ocr_interval_ms(state, 300))
         broadcast_ocr_dashboard()
         return
         
@@ -5196,6 +5392,9 @@ if __name__ == "__main__":
         rows = read_csv_rows()
         sync_lane_state_from_rows(rows)
         write_lane_csv_files(rows)
+        for p in (CSV_FILE, CHECK_FILE, USERS_FILE, BOXES_FILE, CROPS_MANIFEST_FILE):
+            if os.path.isfile(p):
+                secure_chmod(p)
     except Exception as e:
         print(f"-> Lane CSV sync warning: {e}")
 
