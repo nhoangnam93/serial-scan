@@ -1219,10 +1219,7 @@ def is_verified_session(sid):
 
 def is_user_authenticated_session(sid):
     user = connected_users.get(sid, {}) or {}
-    client_id = str(user.get("client_id") or "").strip()
-    if not client_id:
-        return False
-    return client_id in user_registry
+    return bool(user.get("authenticated_user"))
 
 
 def require_verified_session(require_user=True):
@@ -1569,7 +1566,7 @@ html, body {
   position:absolute;
   left:8px;
   right:8px;
-  bottom:8px;
+  top:8px;
   z-index:6;
   pointer-events:none;
   display:flex;
@@ -1597,6 +1594,18 @@ html, body {
   line-height:1.2;
   text-shadow:0 1px 0 rgba(0,0,0,0.32);
 }
+.reader-chip.guide {
+  border-color: rgba(125, 211, 252, 0.28);
+  color: #BAE6FD;
+}
+.reader-chip.guide.warn {
+  border-color: rgba(251, 191, 36, 0.35);
+  color: #FDE68A;
+}
+.reader-chip.guide.ok {
+  border-color: rgba(16, 185, 129, 0.35);
+  color: #BBF7D0;
+}
 .reader-hud-proc {
   display:inline-flex;
   align-items:center;
@@ -1615,6 +1624,46 @@ html, body {
 .reader-hud-proc.active {
   color:#7DD3FC;
   border-color:rgba(56,189,248,0.35);
+}
+.reader-controls {
+  position:absolute;
+  left:0;
+  right:0;
+  bottom:10px;
+  z-index:7;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  gap:10px;
+  pointer-events:none;
+}
+.reader-icon-btn {
+  width:52px;
+  height:52px;
+  border-radius:999px;
+  border:1px solid var(--border);
+  background:rgba(8, 12, 22, 0.86);
+  color:var(--text);
+  font-size:20px;
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  box-shadow:0 10px 24px rgba(0,0,0,0.35);
+  pointer-events:auto;
+}
+.reader-icon-btn:disabled {
+  opacity:0.5;
+}
+.reader-icon-btn.reader-start {
+  color:#fff;
+  background:linear-gradient(180deg, #D62B46, #A0122A);
+  border-color:rgba(255,255,255,0.18);
+}
+.reader-icon-btn.reader-stop {
+  color:#FCA5A5;
+}
+.reader-icon-btn.reader-capture {
+  color:#93C5FD;
 }
 
 .controls { display:flex; gap:6px; margin-top:12px; }
@@ -2196,6 +2245,11 @@ html, body {
   .check-head {
     flex-wrap:wrap;
   }
+  .reader-icon-btn {
+    width:56px;
+    height:56px;
+    font-size:22px;
+  }
 }
 </style>
 </head>
@@ -2405,8 +2459,14 @@ html, body {
               <div class="reader-hud-row">
                 <span id="perfMode" class="reader-chip">Smart OCR session idle</span>
                 <span id="perfLoad" class="reader-chip">M4 OCR pool 0/0</span>
+                <span id="guideChip" class="reader-chip guide">🎯 Align serial label</span>
               </div>
               <div class="reader-hud-proc" id="procNote">Ready.</div>
+            </div>
+            <div class="reader-controls">
+              <button class="reader-icon-btn reader-start btn-pulse" id="startBtn" onclick="startScanner()" title="Start scanner" aria-label="Start scanner">▶</button>
+              <button class="reader-icon-btn reader-stop" id="stopBtn" onclick="stopScanner()" title="Stop scanner" aria-label="Stop scanner" disabled>⏹</button>
+              <button class="reader-icon-btn reader-capture" id="photoBtn" onclick="capturePhoto()" title="Capture photo" aria-label="Capture photo" disabled>📸</button>
             </div>
           </div>
           <div class="func-tabs">
@@ -2421,11 +2481,6 @@ html, body {
           <div class="serial-profile-switch">
             <button class="serial-profile-btn active" id="profileAppleBtn" onclick="setSerialProfile('apple')">Apple Serial</button>
             <button class="serial-profile-btn" id="profileDellBtn" onclick="setSerialProfile('dell')">Dell Service Tag</button>
-          </div>
-          <div class="controls">
-            <button class="btn btn-red btn-pulse" id="startBtn" onclick="startScanner()">▶ Start</button>
-            <button class="btn btn-ghost" id="stopBtn" onclick="stopScanner()" disabled>⏹ Stop</button>
-            <button class="btn btn-ghost" id="photoBtn" onclick="capturePhoto()" disabled>📸 Take Photo</button>
           </div>
           <div class="input-row">
             <input class="input-f" id="manualInput" placeholder="Type serial…" onkeydown="if(event.key==='Enter') saveManual()">
@@ -2633,9 +2688,14 @@ let ocrTimer = null;
 let ocrAwaitingServer = false;
 let ocrAwaitTimeoutTimer = null;
 let photoProcessing = false;
+let photoSendPending = false;
+let photoSendTimeoutTimer = null;
 let photoOnlyStream = null;
 const DEFAULT_OCR_DELAY_MS = 700;
 let ocrDelayMs = 700;
+let ocrBackpressureScore = 0;
+let liveCaptureQuality = 0.72;
+let liveCaptureWidth = 1500;
 let latestOcrSerial = '';
 let latestOcrAt = 0;
 let latestOcrConfidence = 0;
@@ -2643,6 +2703,7 @@ let latestOcrCropImage = '';
 let lastSubmittedCropImage = '';
 let processingMode = '';
 let scanHoldActive = false;
+let lastGuideHint = '';
 let holdSerialValue = '';
 let holdScanPending = null;
 let sharedLanes = [];
@@ -2672,17 +2733,20 @@ let socketIoClientLoading = false;
 let settingsSyncTimer = null;
 let settingsAppliedFromServer = false;
 let isUserAuthenticated = false;
+let lastAudioAt = 0;
 
 function saveJoinPin(pin) {
   const val = String(pin || '').trim();
   joinPin = val;
   if (!val) return;
   localStorage.setItem('nab_scanner_pin', val);
+  syncSocketAuthPayload();
 }
 
 function clearJoinPinCache() {
   joinPin = '';
   localStorage.removeItem('nab_scanner_pin');
+  syncSocketAuthPayload();
 }
 
 function saveSessionToken(token) {
@@ -2690,14 +2754,17 @@ function saveSessionToken(token) {
   sessionToken = val;
   if (!val) {
     localStorage.removeItem('nab_session_token');
+    syncSocketAuthPayload();
     return;
   }
   localStorage.setItem('nab_session_token', val);
+  syncSocketAuthPayload();
 }
 
 function clearSessionTokenCache() {
   sessionToken = '';
   localStorage.removeItem('nab_session_token');
+  syncSocketAuthPayload();
 }
 
 function resetSocketClient() {
@@ -2762,6 +2829,17 @@ function setAuthPill(state = 'required', text = '') {
   if (state === 'ok') el.textContent = 'Authenticated';
   else if (state === 'session') el.textContent = 'Join OK • login required';
   else el.textContent = 'Auth required';
+}
+
+function syncSocketAuthPayload() {
+  if (!sock) return;
+  sock.auth = {
+    client_id: clientId,
+    name: userName || 'Anonymous',
+    pin: joinPin || '',
+    session_token: sessionToken || '',
+    serial_profile: serialProfile,
+  };
 }
 
 function updateModePill() {
@@ -2901,14 +2979,62 @@ function setProcessingState(mode, active, detail = '') {
   el.textContent = detail ? `${label} • ${detail}` : `${label}...`;
 }
 
+function setGuideChip(text, level = 'guide') {
+  const el = document.getElementById('guideChip');
+  if (!el) return;
+  const next = String(text || '').trim();
+  if (!next) return;
+  if (lastGuideHint === `${level}:${next}`) return;
+  lastGuideHint = `${level}:${next}`;
+  el.textContent = next;
+  el.classList.remove('warn', 'ok');
+  if (level === 'warn') el.classList.add('warn');
+  else if (level === 'ok') el.classList.add('ok');
+}
+
+function updateCaptureControls() {
+  const startBtn = document.getElementById('startBtn');
+  const stopBtn = document.getElementById('stopBtn');
+  const photoBtn = document.getElementById('photoBtn');
+  const busy = photoSendPending || photoProcessing || ocrAwaitingServer;
+  if (startBtn) startBtn.disabled = isScanning || busy;
+  if (stopBtn) stopBtn.disabled = !isScanning || busy;
+  if (photoBtn) photoBtn.disabled = !isUserAuthenticated || busy;
+}
+
+function setPhotoSendPending(active) {
+  photoSendPending = !!active;
+  if (photoSendTimeoutTimer) {
+    clearTimeout(photoSendTimeoutTimer);
+    photoSendTimeoutTimer = null;
+  }
+  if (photoSendPending) {
+    setProcessingState('photo', true, 'uploading');
+    photoSendTimeoutTimer = setTimeout(() => {
+      if (!photoSendPending) return;
+      photoSendPending = false;
+      setProcessingState('photo', false);
+      showBanner('Photo upload timeout. Please capture again.', 'warning');
+      updateCaptureControls();
+    }, 5000);
+  }
+  updateCaptureControls();
+}
+
 function clearOcrAwaitState() {
   if (ocrAwaitTimeoutTimer) {
     clearTimeout(ocrAwaitTimeoutTimer);
     ocrAwaitTimeoutTimer = null;
   }
+  if (photoSendTimeoutTimer) {
+    clearTimeout(photoSendTimeoutTimer);
+    photoSendTimeoutTimer = null;
+  }
+  photoSendPending = false;
   ocrAwaitingServer = false;
   photoProcessing = false;
   setProcessingState(processingMode || 'live', false);
+  updateCaptureControls();
 }
 
 function armOcrAwaitTimeout(kind = 'live') {
@@ -3146,7 +3272,9 @@ function updateFunctionModeUI() {
     manualSaveBtn.textContent = mode === 'inventory' ? 'Save' : (mode === 'box' ? 'Check-in' : 'Add');
   }
   if (photoBtn) {
-    photoBtn.textContent = mode === 'inventory' ? '📸 Take Photo' : '📸 Capture Scan';
+    const label = mode === 'inventory' ? 'Capture photo' : 'Capture scan';
+    photoBtn.title = label;
+    photoBtn.setAttribute('aria-label', label);
   }
   if (autosaveCb) {
     autosaveCb.disabled = mode !== 'inventory';
@@ -3157,6 +3285,7 @@ function updateFunctionModeUI() {
     if (sock) sock.emit('get_boxes');
   }
   updateModePill();
+  updateCaptureControls();
 }
 
 function renderQueue() {
@@ -3404,6 +3533,59 @@ function drawOcrCropToCanvas(video, canvas, opts = {}) {
   ctx.filter = 'none';
 }
 
+function evaluateFrameQuality(canvas) {
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) return { ok: false, reason: 'camera_read_fail' };
+  const w = canvas.width || 0;
+  const h = canvas.height || 0;
+  if (w < 60 || h < 24) return { ok: false, reason: 'frame_too_small' };
+  let img;
+  try {
+    img = ctx.getImageData(0, 0, w, h);
+  } catch (_e) {
+    return { ok: false, reason: 'camera_read_fail' };
+  }
+  const data = img.data;
+  const step = Math.max(2, Math.floor(Math.min(w, h) / 180));
+  let sum = 0;
+  let sum2 = 0;
+  let edgeHits = 0;
+  let samples = 0;
+  for (let y = 0; y < h - step; y += step) {
+    for (let x = 0; x < w - step; x += step) {
+      const i = (y * w + x) * 4;
+      const ir = (y * w + (x + step)) * 4;
+      const ib = ((y + step) * w + x) * 4;
+      const l = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+      const lr = 0.299 * data[ir] + 0.587 * data[ir + 1] + 0.114 * data[ir + 2];
+      const lb = 0.299 * data[ib] + 0.587 * data[ib + 1] + 0.114 * data[ib + 2];
+      const grad = Math.abs(l - lr) + Math.abs(l - lb);
+      if (grad > 42) edgeHits += 1;
+      sum += l;
+      sum2 += l * l;
+      samples += 1;
+    }
+  }
+  if (!samples) return { ok: false, reason: 'frame_empty' };
+  const mean = sum / samples;
+  const variance = Math.max(0, (sum2 / samples) - (mean * mean));
+  const edgeDensity = edgeHits / samples;
+
+  if (mean < 45) return { ok: false, reason: 'too_dark', mean, variance, edgeDensity };
+  if (edgeDensity < 0.042) return { ok: false, reason: 'no_label', mean, variance, edgeDensity };
+  if (variance < 170) return { ok: false, reason: 'too_blurry', mean, variance, edgeDensity };
+  return { ok: true, mean, variance, edgeDensity };
+}
+
+function frameQualityHint(result) {
+  const reason = (result && result.reason) || '';
+  if (reason === 'too_dark') return { text: '💡 Increase light on label', level: 'warn' };
+  if (reason === 'too_blurry') return { text: '🎯 Hold steady, refocusing', level: 'warn' };
+  if (reason === 'no_label') return { text: '📦 Center serial label in frame', level: 'warn' };
+  if (reason === 'camera_read_fail') return { text: '📷 Camera stream unstable', level: 'warn' };
+  return { text: '✅ Label looks good', level: 'ok' };
+}
+
 function getUserColor(name) {
   if (!userColors[name]) {
     userColors[name] = colorPalette[colorIdx % colorPalette.length];
@@ -3422,16 +3604,32 @@ if (!clientId) {
 // ============================================
 const AudioCtx = window.AudioContext || window.webkitAudioContext;
 let audioCtx = null;
-function beep(freq = 1200) {
+function playTone(freq = 1200, gainValue = 0.08, durationSec = 0.14) {
   if (!audioCtx) audioCtx = new AudioCtx();
   const o = audioCtx.createOscillator();
   const g = audioCtx.createGain();
   o.connect(g); g.connect(audioCtx.destination);
-  o.frequency.value = freq; g.gain.value = 0.12;
-  o.start(); g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.18);
-  o.stop(audioCtx.currentTime + 0.18);
+  o.frequency.value = freq; g.gain.value = gainValue;
+  o.start();
+  g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + durationSec);
+  o.stop(audioCtx.currentTime + durationSec);
 }
-function beepDupe() { beep(400); setTimeout(() => beep(300), 150); }
+function canPlayFeedback(minGapMs = 500) {
+  if (document.hidden) return false;
+  const now = Date.now();
+  if ((now - lastAudioAt) < minGapMs) return false;
+  lastAudioAt = now;
+  return true;
+}
+function beep(freq = 1200) {
+  if (!canPlayFeedback(420)) return;
+  playTone(freq, 0.07, 0.13);
+}
+function beepDupe() {
+  if (!canPlayFeedback(850)) return;
+  playTone(420, 0.055, 0.12);
+  setTimeout(() => playTone(330, 0.045, 0.11), 130);
+}
 
 // ============================================
 // Socket.IO
@@ -3457,6 +3655,7 @@ function initSocket() {
       serial_profile: serialProfile
     }
   });
+  syncSocketAuthPayload();
 
   sock.on('identity_status', (data) => {
     if (!data || !data.verified) {
@@ -3478,6 +3677,7 @@ function initSocket() {
     }
     setAuthPill(isUserAuthenticated ? 'ok' : 'session');
     setSettingsPill('ok');
+    updateCaptureControls();
     if (isUserAuthenticated) hideAllIdentityModals();
     else showAuthChoiceModal();
   });
@@ -3491,6 +3691,7 @@ function initSocket() {
       if (isScanning) stopScanner();
       setAuthPill('required');
       showPinModal();
+      updateCaptureControls();
       return;
     }
     if (!isUserAuthenticated) {
@@ -3498,6 +3699,7 @@ function initSocket() {
       if (isScanning) stopScanner();
       setAuthPill('session');
       showAuthChoiceModal();
+      updateCaptureControls();
       return;
     }
     setAuthPill('ok');
@@ -3506,6 +3708,7 @@ function initSocket() {
     sock.emit('load_user_settings');
     sock.emit('get_boxes');
     flushPendingSocketEmits();
+    updateCaptureControls();
   });
 
   sock.on('user_settings', (data) => {
@@ -3580,7 +3783,9 @@ function initSocket() {
     }
     sock.emit('session_heartbeat');
     sock.emit('get_session_status');
+    if (isScanning) queueNextOcr(140);
     if (isUserAuthenticated) flushPendingSocketEmits();
+    updateCaptureControls();
   });
 
   sock.on('connect_error', (err) => {
@@ -3591,7 +3796,7 @@ function initSocket() {
     }
     appBootstrapped = false;
     const msg = String((err && (err.message || err.data || '')) || '').toLowerCase();
-    const invalidPin = msg.includes('unauthorized') || msg.includes('invalid') || msg.includes('rejected');
+    const invalidPin = msg.includes('unauthorized') || msg.includes('not authorized') || msg.includes('auth');
     if (invalidPin) {
       resetSocketClient();
       clearJoinPinCache();
@@ -3625,8 +3830,9 @@ function initSocket() {
       connPill.style.color = 'var(--danger)';
     }
     clearOcrAwaitState();
-    setAuthPill('required');
+    setAuthPill((joinPin || sessionToken) ? 'session' : 'required');
     setSettingsPill('warn');
+    updateCaptureControls();
   });
 
   sock.on('logged_out', () => {
@@ -3634,6 +3840,7 @@ function initSocket() {
     clearOcrAwaitState();
     setAuthPill('required');
     setSettingsPill('warn');
+    updateCaptureControls();
   });
 
   sock.on('boxes_updated', (data) => {
@@ -3728,16 +3935,25 @@ function initSocket() {
     latestOcrAt = Date.now();
     latestOcrConfidence = typeof data.ocr_confidence === 'number' ? data.ocr_confidence : latestOcrConfidence;
     latestOcrCropImage = lastSubmittedCropImage || latestOcrCropImage || '';
+    setPhotoSendPending(false);
     clearOcrAwaitState();
     if (data.source === 'photo' && !isScanning) stopPhotoOnlyStream();
     if (typeof data.next_delay_ms === 'number') ocrDelayMs = data.next_delay_ms;
+    updateLiveCaptureTuning('accepted');
+    setGuideChip('✅ Serial detected', 'ok');
     updatePerfNote({ status: 'accepted', ...data, accepted: true });
     onScan(data.serial, { confidence: latestOcrConfidence, source: 'ocr', cropImage: latestOcrCropImage });
     queueNextOcr();
   });
 
   sock.on('ocr_policy', (data) => {
+    setPhotoSendPending(false);
     clearOcrAwaitState();
+    updateLiveCaptureTuning(data && data.status);
+    if (data && data.status === 'low_confidence') setGuideChip('🎯 Low confidence, hold steady', 'warn');
+    if (data && data.status === 'no_text') setGuideChip('📦 Move label into center box', 'warn');
+    if (data && data.status === 'no_match') setGuideChip('🔎 Label seen, refining serial', 'guide');
+    if (data && data.status === 'server_busy') setGuideChip('⏳ OCR queue busy, pacing scan', 'guide');
     if (data && data.status === 'low_confidence') {
       maybeAutoRefocusByConfidence(data.ocr_confidence);
     }
@@ -3886,6 +4102,11 @@ function initSocket() {
     renderFeed();
     updateStats();
   });
+
+  sock.on('photo_received', () => {
+    setPhotoSendPending(false);
+    setProcessingState('photo', true, 'uploaded, OCR running');
+  });
 }
 
 // ============================================
@@ -4014,7 +4235,7 @@ function submitBulkImport() {
 // OCR (Text Recognition) Backend Relay
 // ============================================
 async function doOcrFrame() {
-  if (!isScanning || !isUserAuthenticated || ocrRunning || !sock || ocrAwaitingServer || scanHoldActive) return;
+  if (!isScanning || !isUserAuthenticated || ocrRunning || !sock || !sock.connected || ocrAwaitingServer || scanHoldActive || document.hidden) return;
   const video = document.querySelector('#reader video');
   if (!video || video.readyState < 2) return;
 
@@ -4025,10 +4246,23 @@ async function doOcrFrame() {
       widthRatio: 0.94,
       heightRatio: 0.30,
       centerY: 0.56,
-      qualityWidth: 1500
+      qualityWidth: liveCaptureWidth
     });
+    const quality = evaluateFrameQuality(canvas);
+    if (!quality.ok) {
+      const hint = frameQualityHint(quality);
+      setGuideChip(hint.text, hint.level);
+      if (quality.reason === 'too_blurry' || quality.reason === 'no_label') {
+        refocusCamera(true);
+      }
+      setProcessingState('live', true, hint.text.replace(/^.. /, ''));
+      ocrRunning = false;
+      queueNextOcr(Math.max(180, Math.min(ocrDelayMs, 320)));
+      return;
+    }
+    setGuideChip('✅ Label stable', 'ok');
 
-    const b64 = canvas.toDataURL('image/jpeg', 0.72);
+    const b64 = canvas.toDataURL('image/jpeg', liveCaptureQuality);
     lastSubmittedCropImage = b64;
     setProcessingState('live', true);
     ocrAwaitingServer = true;
@@ -4080,7 +4314,7 @@ async function capturePhoto() {
     toast('Login required before capture.');
     return;
   }
-  if (!sock || photoProcessing) return;
+  if (!sock || !sock.connected || photoProcessing || photoSendPending || ocrAwaitingServer) return;
 
   try {
     const video = await getVideoElementForPhoto();
@@ -4096,11 +4330,22 @@ async function capturePhoto() {
       centerY: 0.54,
       qualityWidth: 1700
     });
+    const quality = evaluateFrameQuality(canvas);
+    if (!quality.ok) {
+      const hint = frameQualityHint(quality);
+      setGuideChip(hint.text, hint.level);
+      if (quality.reason === 'too_blurry' || quality.reason === 'no_label') {
+        refocusCamera(true);
+      }
+      showBanner(hint.text, 'warning');
+      return;
+    }
+    setGuideChip('✅ Label stable', 'ok');
 
     photoProcessing = true;
     flash('info');
     lastSubmittedCropImage = canvas.toDataURL('image/jpeg', 0.82);
-    setProcessingState('photo', true);
+    setPhotoSendPending(true);
     showBanner('📸 Photo captured, processing on server…', 'info');
     ocrAwaitingServer = true;
     armOcrAwaitTimeout('photo');
@@ -4113,7 +4358,7 @@ async function capturePhoto() {
 
 function queueNextOcr(delay = ocrDelayMs) {
   if (ocrTimer) clearTimeout(ocrTimer);
-  if (!isScanning || scanHoldActive) return;
+  if (!isScanning || scanHoldActive || !isUserAuthenticated || !sock || !sock.connected || document.hidden) return;
   ocrTimer = setTimeout(doOcrFrame, Math.max(150, delay || DEFAULT_OCR_DELAY_MS));
 }
 
@@ -4143,8 +4388,22 @@ async function refocusCamera(silent = false) {
     } else if (Array.isArray(caps.focusMode) && caps.focusMode.includes('single-shot')) {
       advanced.push({ focusMode: 'single-shot' });
     }
+    if (Array.isArray(caps.exposureMode) && caps.exposureMode.includes('continuous')) {
+      advanced.push({ exposureMode: 'continuous' });
+    }
+    if (Array.isArray(caps.whiteBalanceMode) && caps.whiteBalanceMode.includes('continuous')) {
+      advanced.push({ whiteBalanceMode: 'continuous' });
+    }
+    if (caps.sharpness && typeof caps.sharpness.max === 'number' && typeof caps.sharpness.min === 'number') {
+      const targetSharpness = Math.max(caps.sharpness.min, Math.min(caps.sharpness.max, caps.sharpness.max * 0.8));
+      advanced.push({ sharpness: targetSharpness });
+    }
+    if (caps.contrast && typeof caps.contrast.max === 'number' && typeof caps.contrast.min === 'number') {
+      const targetContrast = Math.max(caps.contrast.min, Math.min(caps.contrast.max, caps.contrast.max * 0.68));
+      advanced.push({ contrast: targetContrast });
+    }
     if (caps.zoom && typeof caps.zoom.max === 'number' && typeof caps.zoom.min === 'number') {
-      const zoom = Math.max(caps.zoom.min, Math.min(caps.zoom.max, (caps.zoom.min + caps.zoom.max) / 2));
+      const zoom = Math.max(caps.zoom.min, Math.min(caps.zoom.max, Math.max(1.0, caps.zoom.min + ((caps.zoom.max - caps.zoom.min) * 0.22))));
       advanced.push({ zoom });
     }
     if (!advanced.length) return false;
@@ -4164,6 +4423,18 @@ function maybeAutoRefocusByConfidence(confidence) {
   if ((now - lastAutoRefocusAt) < 2500) return;
   lastAutoRefocusAt = now;
   refocusCamera(true);
+}
+
+function updateLiveCaptureTuning(status) {
+  const s = String(status || '');
+  if (s === 'server_busy' || s === 'client_pending') {
+    ocrBackpressureScore = Math.min(10, ocrBackpressureScore + 2);
+  } else if (s === 'accepted' || s === 'no_match' || s === 'no_text' || s === 'ready') {
+    ocrBackpressureScore = Math.max(0, ocrBackpressureScore - 1);
+  }
+  const pressure = ocrBackpressureScore / 10;
+  liveCaptureQuality = 0.72 - (pressure * 0.16);   // 0.56..0.72
+  liveCaptureWidth = Math.round(1500 - (pressure * 420)); // 1080..1500
 }
 
 async function loadCameras() {
@@ -4282,10 +4553,8 @@ function startScanner() {
     ocrAwaitingServer = false;
     stopPhotoOnlyStream();
     const sBtn = document.getElementById('startBtn');
-    sBtn.disabled = true;
     sBtn.classList.remove('btn-pulse');
-    document.getElementById('stopBtn').disabled = false;
-    document.getElementById('photoBtn').disabled = false;
+    updateCaptureControls();
     if (sock) sock.emit('scanner_state', { scanning: true, serial_profile: serialProfile });
     refocusCamera(true);
     queueNextOcr(200);
@@ -4310,19 +4579,17 @@ function stopScanner() {
         isScanning = false;
         if (sock) sock.emit('scanner_state', { scanning: false, serial_profile: serialProfile });
         const sBtn = document.getElementById('startBtn');
-        sBtn.disabled = false;
         sBtn.classList.add('btn-pulse');
-        document.getElementById('stopBtn').disabled = true;
-        document.getElementById('photoBtn').disabled = false;
+        updateCaptureControls();
         r();
       }).catch(() => {
         isScanning = false;
         if (sock) sock.emit('scanner_state', { scanning: false, serial_profile: serialProfile });
-        document.getElementById('photoBtn').disabled = false;
+        updateCaptureControls();
         r();
       });
     } else {
-      document.getElementById('photoBtn').disabled = false;
+      updateCaptureControls();
       stopPhotoOnlyStream();
       r();
     }
@@ -5162,7 +5429,7 @@ async function refreshChecksetIfStale(maxAgeMs = 20000) {
 async function bootstrapApp() {
   if (appBootstrapped) return;
 
-  if (!joinPin) {
+  if (!joinPin && !sessionToken) {
     showPinModal();
     return;
   }
@@ -5185,7 +5452,16 @@ async function bootstrapApp() {
   renderQueue();
   setInterval(() => { loadCheckset(); }, 30000);
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') loadCheckset();
+    if (document.visibilityState === 'visible') {
+      loadCheckset();
+      if (isScanning) queueNextOcr(120);
+    } else {
+      if (ocrTimer) {
+        clearTimeout(ocrTimer);
+        ocrTimer = null;
+      }
+      clearOcrAwaitState();
+    }
   });
   document.addEventListener('keydown', (event) => {
     if (isTypingInInputTarget(event.target)) return;
@@ -5221,6 +5497,7 @@ function init() {
   setSettingsPill('local');
   setAuthPill((joinPin || sessionToken) ? 'session' : 'required');
   updateModePill();
+  updateCaptureControls();
   if (joinPin || sessionToken) {
     bootstrapApp();
     return;
@@ -5982,12 +6259,13 @@ def on_save_user_settings(data):
 
 @socketio.on("scanner_state")
 def on_scanner_state(data):
+    data = data or {}
     if not require_verified_session():
         return
     state = client_ocr_state.get(request.sid)
     if state is None:
         return
-    serial_profile = get_sid_serial_profile(request.sid, (data or {}).get("serial_profile"))
+    serial_profile = get_sid_serial_profile(request.sid, data.get("serial_profile"))
     state["serial_profile"] = serial_profile
     if request.sid in connected_users:
         connected_users[request.sid]["serial_profile"] = serial_profile
@@ -6006,6 +6284,7 @@ def on_scanner_state(data):
 @socketio.on("process_photo_capture")
 def on_process_photo_capture(data):
     global ocr_inflight
+    data = data or {}
     if not require_verified_session():
         return
     state = client_ocr_state.get(request.sid)
@@ -6020,7 +6299,7 @@ def on_process_photo_capture(data):
         return
 
     set_user_session_state(request.sid, "photo", touch=True)
-    serial_profile = get_sid_serial_profile(request.sid, (data or {}).get("serial_profile") or state.get("serial_profile"))
+    serial_profile = get_sid_serial_profile(request.sid, data.get("serial_profile") or state.get("serial_profile"))
     state["serial_profile"] = serial_profile
     if request.sid in connected_users:
         connected_users[request.sid]["serial_profile"] = serial_profile
@@ -6074,6 +6353,7 @@ def on_process_photo_capture(data):
     state["last_submit"] = time.time()
     ocr_inflight += 1
     ocr_metrics["frames_accepted"] += 1
+    emit("photo_received", {"ok": True}, to=request.sid)
     try:
         process_single_image_for_sid(request.sid, img_data, source="photo", serial_profile=serial_profile)
     finally:
@@ -6086,19 +6366,20 @@ def on_process_photo_capture(data):
 
 @socketio.on("save_scan")
 def on_save_scan(data):
+    data = data or {}
     if not require_verified_session():
         return
     ensure_csv_schema()
-    serial_profile = get_sid_serial_profile(request.sid, (data or {}).get("serial_profile"))
-    function_mode = str((data or {}).get("function_mode") or "").strip().lower()
+    serial_profile = get_sid_serial_profile(request.sid, data.get("serial_profile"))
+    function_mode = str(data.get("function_mode") or "").strip().lower()
     if request.sid in connected_users:
         connected_users[request.sid]["serial_profile"] = serial_profile
     serial = normalize_serial_candidate(data.get("serial", "").strip(), serial_profile)
     method = data.get("method", "manual")
     user = data.get("user", "Anonymous")
-    ocr_confidence = float((data or {}).get("ocr_confidence", 0.0) or 0.0)
-    crop_image = (data or {}).get("crop_image")
-    active_box = str((data or {}).get("box_id") or "").strip()
+    ocr_confidence = float(data.get("ocr_confidence", 0.0) or 0.0)
+    crop_image = data.get("crop_image")
+    active_box = str(data.get("box_id") or "").strip()
     if active_box:
         if active_box not in box_registry:
             emit("save_rejected", {"serial": serial, "reason": "box_not_found"}, to=request.sid)
@@ -6108,9 +6389,9 @@ def on_save_scan(data):
             return
     if active_box and active_box in box_registry:
         box_name = (box_registry[active_box].get("name") or f"Box-{active_box}").strip()
-        lane = ensure_lane((data or {}).get("lane") or box_name)
+        lane = ensure_lane(data.get("lane") or box_name)
     else:
-        lane = ensure_lane((data or {}).get("lane"))
+        lane = ensure_lane(data.get("lane"))
     if not allow_serial(serial, serial_profile):
         emit("save_rejected", {
             "serial": serial,
@@ -6503,6 +6784,7 @@ frame_counts = {}
 @socketio.on('process_ocr_frame')
 def handle_ocr_frame(data):
     global ocr_inflight
+    data = data or {}
     sid = request.sid
     if not require_verified_session():
         return
@@ -6514,7 +6796,7 @@ def handle_ocr_frame(data):
     if not state.get("scanning"):
         emit_ocr_policy(sid, status="idle", accepted=False, next_delay_ms=get_client_ocr_interval_ms(state, 250))
         return
-    serial_profile = get_sid_serial_profile(sid, (data or {}).get("serial_profile") or state.get("serial_profile"))
+    serial_profile = get_sid_serial_profile(sid, data.get("serial_profile") or state.get("serial_profile"))
     state["serial_profile"] = serial_profile
     if sid in connected_users:
         connected_users[sid]["serial_profile"] = serial_profile

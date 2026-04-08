@@ -67,6 +67,24 @@ def _build_enhanced_variant(img_bytes):
         return b""
 
 
+def _build_threshold_variant(img_bytes):
+    try:
+        with Image.open(BytesIO(img_bytes)) as im:
+            gray = ImageOps.grayscale(im)
+            boosted = ImageOps.autocontrast(gray, cutoff=1)
+            boosted = ImageEnhance.Contrast(boosted).enhance(2.6)
+            boosted = ImageEnhance.Sharpness(boosted).enhance(2.6)
+            bw = boosted.point(lambda p: 255 if p > 138 else 0)
+            w, h = bw.size
+            scale = 1.6
+            up = bw.resize((int(w * scale), int(h * scale)), Image.Resampling.NEAREST)
+            out = BytesIO()
+            up.save(out, format="JPEG", quality=92)
+            return out.getvalue()
+    except Exception:
+        return b""
+
+
 def _serial_score(result, serial_profile="apple"):
     profile = normalize_serial_profile(serial_profile)
     text = (result or {}).get("text", "") or ""
@@ -103,14 +121,23 @@ def recognize_text_from_binary(img_data, serial_profile="apple"):
             or not primary_serial
         )
         if needs_fallback:
+            variants = []
             enhanced_bytes = _build_enhanced_variant(img_bytes)
             if enhanced_bytes:
-                enhanced = _run_vision_ocr(enhanced_bytes)
-                enhanced_score, enhanced_serial = _serial_score(enhanced, profile)
-                if enhanced_score > primary_score:
-                    best = dict(enhanced)
-                    best["serial_hint"] = enhanced_serial
-                    best["variant"] = "enhanced"
+                variants.append(("enhanced", enhanced_bytes))
+            threshold_bytes = _build_threshold_variant(img_bytes)
+            if threshold_bytes:
+                variants.append(("threshold", threshold_bytes))
+
+            top_score = primary_score
+            for variant_name, variant_bytes in variants:
+                result = _run_vision_ocr(variant_bytes)
+                score, serial = _serial_score(result, profile)
+                if score > top_score:
+                    top_score = score
+                    best = dict(result)
+                    best["serial_hint"] = serial
+                    best["variant"] = variant_name
 
         return best
     except Exception as e:
