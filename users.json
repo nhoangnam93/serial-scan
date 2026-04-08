@@ -1,10 +1,10 @@
 {
   "3d91d859-2351-46ca-9a80-4d57694222af": {
     "name": "Max",
-    "pin": "1993"
+    "pin_hash": "scrypt$16384$8$1$eb1d2acd9709dbd17821fc12fa59d94a$72a42ea79fbdfc175bc43037016110060994153acc476bbdbf5eeacb1c4ae339"
   },
   "285b79ed-1df6-443d-8d47-9c3c45ecd9b7": {
     "name": "Nam",
-    "pin": "1994"
+    "pin_hash": "scrypt$16384$8$1$8ff1368a3c8e3be8df50e3d7de301b1f$8081d846b6daa71e1d515472aa6b74cd4a87b857a0d9c8ef38b0be999b81f38a"
   }
 }

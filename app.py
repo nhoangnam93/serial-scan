@@ -8,10 +8,13 @@ Multiple users scan simultaneously; all see results in real time.
 import eventlet
 eventlet.monkey_patch()
 from eventlet import tpool
+import eventlet.debug
+eventlet.debug.hub_exceptions(False)
 
 import os
 import csv
 import json
+import sqlite3
 import socket
 import base64
 import hashlib
@@ -30,7 +33,7 @@ from collections import deque
 from datetime import datetime
 from io import StringIO, BytesIO
 from flask import Flask, request, jsonify, send_file, Response
-from flask_socketio import SocketIO, emit, join_room, leave_room
+from flask_socketio import SocketIO, emit, join_room, leave_room, disconnect
 from src.vision import recognize_text_from_binary
 from serial_parser import (
     extract_serial_from_text,
@@ -209,8 +212,11 @@ def lanes_snapshot():
 
 def broadcast_queue():
     payload = lanes_snapshot()
-    socketio.emit("lanes_data", payload)
-    socketio.emit("queue_data", payload)
+    for sid, user in list(connected_users.items()):
+        if not user.get("verified"):
+            continue
+        socketio.emit("lanes_data", payload, to=sid)
+        socketio.emit("queue_data", payload, to=sid)
 
 
 def is_priority_scanner(state):
@@ -373,11 +379,36 @@ def process_single_image_for_sid(sid, img_data, source="live_photo", serial_prof
     )
     broadcast_ocr_dashboard()
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SECRET_FILE = os.path.join(BASE_DIR, ".scanner_secret")
+
+
+def load_or_create_secret_key():
+    from_env = str(os.environ.get("SECRET_KEY") or "").strip()
+    if from_env:
+        return from_env
+    try:
+        if os.path.isfile(SECRET_FILE):
+            with open(SECRET_FILE, "r") as f:
+                value = (f.read() or "").strip()
+            if len(value) >= 32:
+                return value
+    except Exception:
+        pass
+    value = secrets.token_hex(32)
+    try:
+        with open(SECRET_FILE, "w") as f:
+            f.write(value)
+        os.chmod(SECRET_FILE, 0o600)
+    except Exception:
+        pass
+    return value
+
+
 app = Flask(__name__)
-app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
+app.config["SECRET_KEY"] = load_or_create_secret_key()
 socketio = SocketIO(app, async_mode="eventlet")
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CSV_FILE = os.path.join(BASE_DIR, "serial_numbers.csv")
 LANE_CSV_DIR = os.path.join(BASE_DIR, "lane_csv")
 CHECK_FILE = os.path.join(BASE_DIR, "check.csv")
@@ -394,7 +425,9 @@ OCR_MIN_CONFIDENCE = float(os.environ.get("OCR_MIN_CONFIDENCE", "0.99"))
 STRICT_MACBOOK_ONLY = os.environ.get("STRICT_MACBOOK_ONLY", "1").lower() in {"1", "true", "yes", "on"}
 DEFAULT_SERIAL_PROFILE = normalize_serial_profile(os.environ.get("DEFAULT_SERIAL_PROFILE", "apple"))
 JOIN_PIN = os.environ.get("JOIN_PIN", "2026")
+JOIN_PIN_HASH = os.environ.get("JOIN_PIN_HASH", "").strip()
 USERS_FILE = os.path.join(BASE_DIR, "users.json")
+DB_FILE = os.path.join(BASE_DIR, "scanner.db")
 user_registry = {}  # client_id -> {name, pin_hash}
 MAX_OCR_IMAGE_DATA_URL_CHARS = int(os.environ.get("MAX_OCR_IMAGE_DATA_URL_CHARS", "7000000"))
 MAX_CROP_BYTES = int(os.environ.get("MAX_CROP_BYTES", "6000000"))
@@ -402,6 +435,16 @@ PIN_MIN_LEN = int(os.environ.get("PIN_MIN_LEN", "4"))
 PIN_MAX_LEN = int(os.environ.get("PIN_MAX_LEN", "16"))
 PIN_HASH_PREFIX = "scrypt$"
 DATA_FILE_MODE = 0o600
+APP_BUILD_ID = datetime.now().strftime("%Y%m%d%H%M%S")
+SESSION_TOKEN_TTL_SECONDS = int(os.environ.get("SESSION_TOKEN_TTL_SECONDS", "1209600"))
+DEFAULT_USER_SETTINGS = {
+    "active_function": "inventory",
+    "serial_profile": DEFAULT_SERIAL_PROFILE,
+    "camera_pref": "environment",
+    "autosave_pref": "1",
+    "selected_box_id": "",
+}
+ALLOWED_FUNCTIONS = {"inventory", "box", "import"}
 
 # Track connected users: sid -> {name, ip, connected_at}
 connected_users = {}
@@ -434,6 +477,302 @@ sid_box_membership = {}  # sid -> box_id
 data_lock = threading.Lock()
 
 
+def db_connect():
+    conn = sqlite3.connect(DB_FILE, timeout=7.5)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def init_database():
+    os.makedirs(BASE_DIR, exist_ok=True)
+    with data_lock:
+        with db_connect() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    client_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    pin_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_login_at TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_settings (
+                    client_id TEXT PRIMARY KEY,
+                    settings_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(client_id) REFERENCES users(client_id) ON DELETE CASCADE
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS boxes (
+                    box_id TEXT PRIMARY KEY,
+                    payload_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.commit()
+    secure_chmod(DB_FILE)
+
+
+def sanitize_user_settings(raw):
+    incoming = raw if isinstance(raw, dict) else {}
+    cleaned = dict(DEFAULT_USER_SETTINGS)
+    mode = str(incoming.get("active_function", cleaned["active_function"])).strip().lower()
+    cleaned["active_function"] = mode if mode in ALLOWED_FUNCTIONS else DEFAULT_USER_SETTINGS["active_function"]
+    cleaned["serial_profile"] = normalize_serial_profile(incoming.get("serial_profile", cleaned["serial_profile"]))
+    camera_pref = str(incoming.get("camera_pref", cleaned["camera_pref"])).strip().lower()
+    if camera_pref in {"environment", "user"}:
+        cleaned["camera_pref"] = camera_pref
+    elif re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", camera_pref):
+        cleaned["camera_pref"] = camera_pref
+    else:
+        cleaned["camera_pref"] = DEFAULT_USER_SETTINGS["camera_pref"]
+    autosave_pref = str(incoming.get("autosave_pref", cleaned["autosave_pref"])).strip()
+    cleaned["autosave_pref"] = "0" if autosave_pref == "0" else "1"
+    selected_box_id = str(incoming.get("selected_box_id", cleaned["selected_box_id"])).strip()
+    cleaned["selected_box_id"] = selected_box_id[:64] if re.fullmatch(r"[A-Za-z0-9._:-]{0,64}", selected_box_id) else ""
+    return cleaned
+
+
+def db_list_users():
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT client_id, name, pin_hash FROM users ORDER BY updated_at DESC"
+        ).fetchall()
+    return [{"client_id": r["client_id"], "name": r["name"], "pin_hash": r["pin_hash"]} for r in rows]
+
+
+def db_get_user(client_id):
+    if not client_id:
+        return None
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT client_id, name, pin_hash FROM users WHERE client_id = ?",
+            (str(client_id),),
+        ).fetchone()
+    if not row:
+        return None
+    return {"client_id": row["client_id"], "name": row["name"], "pin_hash": row["pin_hash"]}
+
+
+def db_upsert_user(client_id, name, pin_hash):
+    cid = str(client_id or "").strip()
+    if not cid:
+        return False
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with data_lock:
+        with db_connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO users (client_id, name, pin_hash, created_at, updated_at, last_login_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(client_id) DO UPDATE SET
+                    name=excluded.name,
+                    pin_hash=excluded.pin_hash,
+                    updated_at=excluded.updated_at
+                """,
+                (cid, (name or "Anonymous")[:64], pin_hash, now, now, now),
+            )
+            conn.commit()
+    return True
+
+
+def db_update_user_name(client_id, name):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with data_lock:
+        with db_connect() as conn:
+            conn.execute(
+                "UPDATE users SET name = ?, updated_at = ? WHERE client_id = ?",
+                ((name or "Anonymous")[:64], now, str(client_id or "")),
+            )
+            conn.commit()
+
+
+def db_update_user_pin(client_id, pin_hash):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with data_lock:
+        with db_connect() as conn:
+            conn.execute(
+                "UPDATE users SET pin_hash = ?, updated_at = ? WHERE client_id = ?",
+                (pin_hash, now, str(client_id or "")),
+            )
+            conn.commit()
+
+
+def db_touch_login(client_id):
+    with data_lock:
+        with db_connect() as conn:
+            conn.execute(
+                "UPDATE users SET last_login_at = ? WHERE client_id = ?",
+                (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), str(client_id or "")),
+            )
+            conn.commit()
+
+
+def db_get_user_settings(client_id):
+    cid = str(client_id or "").strip()
+    if not cid:
+        return dict(DEFAULT_USER_SETTINGS)
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT settings_json FROM user_settings WHERE client_id = ?",
+            (cid,),
+        ).fetchone()
+    if not row:
+        return dict(DEFAULT_USER_SETTINGS)
+    try:
+        payload = json.loads(row["settings_json"] or "{}")
+    except Exception:
+        payload = {}
+    return sanitize_user_settings(payload)
+
+
+def db_save_user_settings(client_id, incoming):
+    cid = str(client_id or "").strip()
+    if not cid:
+        return dict(DEFAULT_USER_SETTINGS)
+    current = db_get_user_settings(cid)
+    merged = dict(current)
+    merged.update(incoming if isinstance(incoming, dict) else {})
+    clean = sanitize_user_settings(merged)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    payload = json.dumps(clean, separators=(",", ":"), ensure_ascii=True)
+    with data_lock:
+        with db_connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO user_settings (client_id, settings_json, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(client_id) DO UPDATE SET
+                    settings_json=excluded.settings_json,
+                    updated_at=excluded.updated_at
+                """,
+                (cid, payload, now),
+            )
+            conn.commit()
+    return clean
+
+
+def db_ensure_user_settings(client_id):
+    cid = str(client_id or "").strip()
+    if not cid:
+        return dict(DEFAULT_USER_SETTINGS)
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT settings_json FROM user_settings WHERE client_id = ?",
+            (cid,),
+        ).fetchone()
+    if row:
+        try:
+            return sanitize_user_settings(json.loads(row["settings_json"] or "{}"))
+        except Exception:
+            pass
+    return db_save_user_settings(cid, DEFAULT_USER_SETTINGS)
+
+
+def migrate_users_json_to_db():
+    if not os.path.isfile(USERS_FILE):
+        return
+    try:
+        with open(USERS_FILE, "r") as f:
+            legacy = json.load(f) or {}
+    except Exception:
+        return
+    if not isinstance(legacy, dict):
+        return
+    for cid, profile in legacy.items():
+        if not isinstance(profile, dict):
+            continue
+        client_id = str(cid or "").strip()
+        if not client_id:
+            continue
+        name = str(profile.get("name") or "Anonymous").strip() or "Anonymous"
+        pin_hash = str(profile.get("pin_hash") or "").strip()
+        plain_pin = str(profile.get("pin") or "").strip()
+        if plain_pin and not pin_hash:
+            pin_hash = hash_pin(plain_pin)
+        if not pin_hash:
+            continue
+        existing = db_get_user(client_id)
+        if existing and existing.get("pin_hash"):
+            continue
+        db_upsert_user(client_id, name, pin_hash)
+
+
+def db_load_boxes():
+    result = {}
+    with db_connect() as conn:
+        rows = conn.execute("SELECT box_id, payload_json FROM boxes").fetchall()
+    for row in rows:
+        box_id = str(row["box_id"] or "").strip()
+        if not box_id:
+            continue
+        try:
+            payload = json.loads(row["payload_json"] or "{}")
+        except Exception:
+            payload = {}
+        if isinstance(payload, dict):
+            result[box_id] = payload
+    return result
+
+
+def db_save_boxes(registry):
+    data = registry if isinstance(registry, dict) else {}
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with data_lock:
+        with db_connect() as conn:
+            conn.execute("BEGIN")
+            existing_ids = {r["box_id"] for r in conn.execute("SELECT box_id FROM boxes").fetchall()}
+            incoming_ids = set()
+            for box_id, payload in data.items():
+                bid = str(box_id or "").strip()
+                if not bid:
+                    continue
+                incoming_ids.add(bid)
+                payload_json = json.dumps(payload if isinstance(payload, dict) else {}, separators=(",", ":"), ensure_ascii=True)
+                conn.execute(
+                    """
+                    INSERT INTO boxes (box_id, payload_json, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(box_id) DO UPDATE SET
+                        payload_json=excluded.payload_json,
+                        updated_at=excluded.updated_at
+                    """,
+                    (bid, payload_json, now),
+                )
+            stale_ids = existing_ids - incoming_ids
+            if stale_ids:
+                conn.executemany("DELETE FROM boxes WHERE box_id = ?", [(sid,) for sid in stale_ids])
+            conn.commit()
+
+
+def migrate_boxes_json_to_db():
+    with db_connect() as conn:
+        row = conn.execute("SELECT COUNT(*) AS cnt FROM boxes").fetchone()
+    if row and int(row["cnt"] or 0) > 0:
+        return
+    if not os.path.isfile(BOXES_FILE):
+        return
+    try:
+        with open(BOXES_FILE, "r") as f:
+            payload = json.load(f) or {}
+    except Exception:
+        return
+    if isinstance(payload, dict) and payload:
+        db_save_boxes(payload)
+
+
 def secure_chmod(path, mode=DATA_FILE_MODE):
     try:
         os.chmod(path, mode)
@@ -463,6 +802,67 @@ def atomic_write_json(path, payload):
 def is_reasonable_pin(pin):
     p = str(pin or "").strip()
     return PIN_MIN_LEN <= len(p) <= PIN_MAX_LEN
+
+
+def join_pin_matches(pin):
+    candidate = str(pin or "").strip()
+    if not candidate:
+        return False
+    if JOIN_PIN_HASH:
+        return verify_pin(candidate, JOIN_PIN_HASH)
+    if not JOIN_PIN:
+        return True
+    return hmac.compare_digest(candidate, JOIN_PIN)
+
+
+def _b64u_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _b64u_decode(data: str) -> bytes:
+    raw = str(data or "")
+    pad = "=" * ((4 - len(raw) % 4) % 4)
+    return base64.urlsafe_b64decode(raw + pad)
+
+
+def issue_session_token(client_id):
+    cid = str(client_id or "").strip()
+    if not cid:
+        return ""
+    now = int(time.time())
+    payload = {
+        "cid": cid,
+        "iat": now,
+        "exp": now + max(300, SESSION_TOKEN_TTL_SECONDS),
+    }
+    body = _b64u_encode(json.dumps(payload, separators=(",", ":"), ensure_ascii=True).encode("utf-8"))
+    secret = str(app.config.get("SECRET_KEY") or "").encode("utf-8")
+    sig = hmac.new(secret, body.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{body}.{sig}"
+
+
+def verify_session_token(token):
+    raw = str(token or "").strip()
+    if not raw or "." not in raw:
+        return None
+    body, sig = raw.split(".", 1)
+    if not body or not sig:
+        return None
+    secret = str(app.config.get("SECRET_KEY") or "").encode("utf-8")
+    expected = hmac.new(secret, body.encode("utf-8"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, sig):
+        return None
+    try:
+        payload = json.loads(_b64u_decode(body).decode("utf-8"))
+    except Exception:
+        return None
+    cid = str((payload or {}).get("cid") or "").strip()
+    if not cid or not re.fullmatch(r"[A-Za-z0-9._:-]{1,64}", cid):
+        return None
+    exp = int((payload or {}).get("exp") or 0)
+    if exp <= int(time.time()):
+        return None
+    return cid
 
 
 def hash_pin(pin, salt=None):
@@ -597,21 +997,20 @@ def get_qr_base64(url):
 
 def load_box_registry():
     global box_registry
-    if not os.path.isfile(BOXES_FILE):
-        box_registry = {}
-        return
     try:
-        with open(BOXES_FILE, "r") as f:
-            box_registry = json.load(f)
-        secure_chmod(BOXES_FILE)
+        init_database()
+        migrate_boxes_json_to_db()
+        box_registry = db_load_boxes()
     except Exception as e:
-        print(f"-> Error loading box registry: {e}")
+        print(f"-> Error loading box registry from db: {e}")
         box_registry = {}
     normalize_box_registry()
 
 
 def save_box_registry():
     try:
+        db_save_boxes(box_registry)
+        # Keep a JSON mirror for compatibility/debugging.
         with data_lock:
             atomic_write_json(BOXES_FILE, box_registry)
     except Exception as e:
@@ -620,58 +1019,43 @@ def save_box_registry():
 
 def load_user_registry():
     global user_registry
-    if not os.path.isfile(USERS_FILE):
-        user_registry = {}
-        return
+    init_database()
+    migrate_users_json_to_db()
+    user_registry = {}
     try:
-        with open(USERS_FILE, "r") as f:
-            user_registry = json.load(f)
-        secure_chmod(USERS_FILE)
+        for row in db_list_users():
+            user_registry[row["client_id"]] = {
+                "name": row["name"],
+                "pin_hash": row["pin_hash"],
+            }
+            db_ensure_user_settings(row["client_id"])
     except Exception as e:
-        print(f"-> Error loading user registry: {e}")
+        print(f"-> Error loading users from db: {e}")
         user_registry = {}
-    migrated = False
-    for cid, profile in list((user_registry or {}).items()):
-        if not isinstance(profile, dict):
-            user_registry.pop(cid, None)
-            migrated = True
-            continue
-        plain_pin = str(profile.get("pin", "")).strip()
-        pin_hash = str(profile.get("pin_hash", "")).strip()
-        if plain_pin and not pin_hash:
-            profile["pin_hash"] = hash_pin(plain_pin)
-            profile.pop("pin", None)
-            migrated = True
-        elif pin_hash and profile.get("pin"):
-            profile.pop("pin", None)
-            migrated = True
-    if migrated:
-        try:
-            with data_lock:
-                atomic_write_json(USERS_FILE, user_registry)
-        except Exception as e:
-            print(f"-> Error migrating user registry pins: {e}")
 
 
 def save_user_to_registry(client_id, name, pin):
     global user_registry
-    user_registry[client_id] = {"name": name, "pin_hash": hash_pin(str(pin or "").strip())}
-    try:
-        with data_lock:
-            atomic_write_json(USERS_FILE, user_registry)
-    except Exception as e:
-        print(f"-> Error saving user registry: {e}")
+    cid = str(client_id or "").strip()
+    if not cid:
+        return
+    pin_hash = hash_pin(str(pin or "").strip())
+    if not db_upsert_user(cid, name, pin_hash):
+        return
+    user_registry[cid] = {"name": name, "pin_hash": pin_hash}
+    db_ensure_user_settings(cid)
 
 
 def find_user_by_pin(pin, exclude_client_id=None):
     target = str(pin or "").strip()
     if not target:
         return None, None
-    for cid, profile in (user_registry or {}).items():
+    for row in db_list_users():
+        cid = row["client_id"]
         if exclude_client_id and cid == exclude_client_id:
             continue
-        if verify_pin(target, (profile or {}).get("pin_hash") or (profile or {}).get("pin")):
-            return cid, profile
+        if verify_pin(target, row.get("pin_hash")):
+            return cid, {"name": row.get("name", "Anonymous"), "pin_hash": row.get("pin_hash", "")}
     return None, None
 
 
@@ -819,10 +1203,62 @@ def box_payload_for(sid=None):
 
 def emit_boxes_updated(target_sid=None):
     if target_sid:
+        if not connected_users.get(target_sid, {}).get("verified"):
+            return
         socketio.emit("boxes_updated", box_payload_for(target_sid), to=target_sid)
         return
     for sid in list(connected_users.keys()):
+        if not connected_users.get(sid, {}).get("verified"):
+            continue
         socketio.emit("boxes_updated", box_payload_for(sid), to=sid)
+
+
+def is_verified_session(sid):
+    return bool(connected_users.get(sid, {}).get("verified"))
+
+
+def is_user_authenticated_session(sid):
+    user = connected_users.get(sid, {}) or {}
+    client_id = str(user.get("client_id") or "").strip()
+    if not client_id:
+        return False
+    return client_id in user_registry
+
+
+def require_verified_session(require_user=True):
+    if not is_verified_session(request.sid):
+        emit("auth_error", {"reason": "not_verified"}, to=request.sid)
+        return False
+    if require_user and not is_user_authenticated_session(request.sid):
+        emit("auth_error", {"reason": "user_auth_required"}, to=request.sid)
+        emit("session_status", {
+            "verified": True,
+            "authenticated_user": False,
+            "requires_user_auth": True,
+        }, to=request.sid)
+        return False
+    if is_verified_session(request.sid):
+        return True
+    return False
+
+
+def emit_initial_data_for_sid(sid):
+    if not is_verified_session(sid) or not is_user_authenticated_session(sid):
+        return
+    rows = read_csv_rows()
+    sync_lane_state_from_rows(rows)
+    history = [{
+        "serial": r.get("Serial Number", ""),
+        "timestamp": r.get("Timestamp", ""),
+        "method": r.get("Scanned By", ""),
+        "user": r.get("User", ""),
+        "lane": r.get("Lane", "General") or "General",
+        "checked": matches_checklist_any(r.get("Serial Number", "")),
+    } for r in rows]
+    history.reverse()
+    socketio.emit("history_data", history, to=sid)
+    socketio.emit("lanes_data", lanes_snapshot(), to=sid)
+    emit_boxes_updated(sid)
 
 
 def leave_box_for_sid(sid, notify=True):
@@ -916,6 +1352,138 @@ def remove_session(sid):
 # ============================================
 
 LEGACY_INDEX_HTML = """
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>NAB Serial Scanner</title>
+<style>
+* { box-sizing:border-box; margin:0; padding:0; }
+:root {
+  --bg:#070b14;
+  --bg2:#0d1424;
+  --bg-card:#10192b;
+  --bg-card-hover:#15213a;
+  --bg-input:#0d1527;
+  --text:#e7edf8;
+  --text2:#a8b4cc;
+  --text3:#6f7f9e;
+  --border:rgba(255,255,255,0.09);
+  --nab-red:#C8102E;
+  --nab-red-dark:#8f0c22;
+  --nab-red-glow:rgba(200,16,46,0.35);
+  --success:#10B981;
+  --success-bg:rgba(16,185,129,0.14);
+  --warning:#F59E0B;
+  --warning-bg:rgba(245,158,11,0.14);
+  --danger:#EF4444;
+  --danger-bg:rgba(239,68,68,0.14);
+  --info:#3B82F6;
+  --info-bg:rgba(59,130,246,0.14);
+  --purple:#8B5CF6;
+  --purple-bg:rgba(139,92,246,0.14);
+  --radius:16px;
+  --radius-sm:10px;
+}
+html, body {
+  min-height:100%;
+  background:
+    radial-gradient(1000px 500px at 10% -10%, rgba(59,130,246,0.12), transparent 60%),
+    radial-gradient(900px 420px at 110% -20%, rgba(200,16,46,0.1), transparent 60%),
+    linear-gradient(180deg, var(--bg2), var(--bg));
+  color:var(--text);
+  font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
+}
+.app { max-width:1280px; margin:0 auto; padding:20px; }
+.header {
+  display:flex; align-items:center; justify-content:space-between; gap:12px;
+  border-bottom:1px solid var(--border); padding-bottom:14px; margin-bottom:14px;
+}
+.logo { display:flex; gap:12px; align-items:center; }
+.logo-icon {
+  width:44px; height:44px; border-radius:12px; display:grid; place-items:center;
+  background:linear-gradient(135deg,var(--nab-red),var(--nab-red-dark)); color:#fff; font-weight:800;
+  box-shadow:0 8px 24px var(--nab-red-glow);
+}
+.logo h1 { font-size:38px; line-height:1.05; font-weight:800; }
+.logo small { color:var(--text2); font-size:13px; }
+.header-right {
+  display:flex;
+  flex-direction:column;
+  align-items:flex-end;
+  gap:6px;
+  min-width:min(68vw, 760px);
+}
+.header-row {
+  display:flex;
+  align-items:center;
+  justify-content:flex-end;
+  gap:8px;
+  flex-wrap:wrap;
+}
+.header-action {
+  flex:0;
+  padding:6px 10px;
+  font-size:11px;
+}
+.user-pill,.conn-pill,.settings-pill,.mode-pill,.auth-pill {
+  display:flex; align-items:center; gap:6px; border:1px solid var(--border);
+  border-radius:999px; padding:7px 12px; font-size:12px; background:rgba(255,255,255,0.04);
+}
+.mode-pill {
+  color:var(--info);
+  background:var(--info-bg);
+  border-color:rgba(56,189,248,0.24);
+}
+.settings-pill {
+  color:var(--text2);
+  background:rgba(59,130,246,0.12);
+  border-color:rgba(59,130,246,0.25);
+}
+.settings-pill.ok {
+  color:var(--success);
+  background:var(--success-bg);
+  border-color:rgba(16,185,129,0.25);
+}
+.settings-pill.warn {
+  color:var(--warning);
+  background:var(--warning-bg);
+  border-color:rgba(245,158,11,0.25);
+}
+.auth-pill {
+  color:var(--warning);
+  background:var(--warning-bg);
+  border-color:rgba(245,158,11,0.25);
+}
+.auth-pill.ok {
+  color:var(--success);
+  background:var(--success-bg);
+  border-color:rgba(16,185,129,0.25);
+}
+.auth-pill.req {
+  color:var(--danger);
+  background:var(--danger-bg);
+  border-color:rgba(239,68,68,0.25);
+}
+.stats { display:grid; grid-template-columns:repeat(5,1fr); gap:10px; margin-bottom:12px; }
+.stat {
+  background:var(--bg-card); border:1px solid var(--border); border-radius:12px; padding:12px;
+}
+.stat-label { color:var(--text3); text-transform:uppercase; font-size:10px; font-weight:700; letter-spacing:0.5px; }
+.stat-val { margin-top:6px; font-size:36px; font-weight:800; line-height:1; }
+.stat.red .stat-val{ color:#fb7185; } .stat.green .stat-val{ color:#34d399; }
+.stat.blue .stat-val{ color:#60a5fa; } .stat.yellow .stat-val{ color:#fbbf24; }
+.stat.purple .stat-val{ color:#a78bfa; }
+.grid { display:grid; grid-template-columns:1.05fr 1fr 1fr; gap:12px; align-items:start; }
+@media (max-width:1100px) { .stats{grid-template-columns:repeat(3,1fr);} .grid{grid-template-columns:1fr;} }
+@media (max-width:760px) {
+  .header { flex-direction:column; align-items:flex-start; gap:10px; }
+  .header-right { width:100%; min-width:0; align-items:stretch; }
+  .header-row { justify-content:flex-start; width:100%; gap:6px; }
+  .header-action { padding:6px 8px; font-size:10px; }
+  .logo h1 { font-size:24px; }
+  .logo small { font-size:11px; }
   .grid { grid-template-columns:1fr; gap:12px; }
   .card-body { padding:12px; }
   .card-head { padding:12px 14px; }
@@ -947,6 +1515,10 @@ LEGACY_INDEX_HTML = """
   .camera-sel { font-size:12px; padding:8px 10px; max-width:none; flex:1; }
   .user-pill { font-size:12px; padding:8px 14px; }
   .conn-pill { font-size:12px; padding:8px 12px; }
+  .settings-pill { font-size:12px; padding:8px 12px; }
+  .mode-pill { font-size:12px; padding:8px 12px; }
+  .auth-pill { font-size:12px; padding:8px 12px; }
+  .settings-pill { display:none; }
 }
 
 /* iOS safe area */
@@ -984,6 +1556,7 @@ LEGACY_INDEX_HTML = """
 }
 
 /* Scanner */
+.reader-shell { position:relative; width:100%; }
 #reader { width:100%; border-radius:var(--radius-sm); overflow:hidden; background:#000; }
 #reader video { border-radius:var(--radius-sm) !important; object-fit:cover; }
 #reader__dashboard_section { display:none !important; }
@@ -992,6 +1565,57 @@ LEGACY_INDEX_HTML = """
 #qr-shaded-region { border-color:rgba(0,0,0,0.55) !important; }
 /* Ensure video fills on iOS */
 #reader video { -webkit-playsinline:true; playsinline:true; }
+.reader-hud {
+  position:absolute;
+  left:8px;
+  right:8px;
+  bottom:8px;
+  z-index:6;
+  pointer-events:none;
+  display:flex;
+  flex-direction:column;
+  gap:6px;
+}
+.reader-hud-row {
+  display:flex;
+  gap:6px;
+  flex-wrap:wrap;
+}
+.reader-chip {
+  display:inline-flex;
+  align-items:center;
+  gap:4px;
+  max-width:100%;
+  padding:5px 8px;
+  border-radius:8px;
+  border:1px solid rgba(255,255,255,0.2);
+  background:rgba(4,9,20,0.72);
+  backdrop-filter: blur(5px);
+  color:#E6EDF9;
+  font-size:10px;
+  font-weight:700;
+  line-height:1.2;
+  text-shadow:0 1px 0 rgba(0,0,0,0.32);
+}
+.reader-hud-proc {
+  display:inline-flex;
+  align-items:center;
+  width:fit-content;
+  max-width:100%;
+  padding:5px 8px;
+  border-radius:8px;
+  border:1px solid rgba(255,255,255,0.18);
+  background:rgba(4,9,20,0.72);
+  backdrop-filter: blur(5px);
+  color:#CBD5E1;
+  font-size:10px;
+  font-weight:600;
+  min-height:20px;
+}
+.reader-hud-proc.active {
+  color:#7DD3FC;
+  border-color:rgba(56,189,248,0.35);
+}
 
 .controls { display:flex; gap:6px; margin-top:12px; }
 .func-tabs {
@@ -1629,7 +2253,7 @@ LEGACY_INDEX_HTML = """
   <div class="modal">
     <div style="font-size:42px; margin-bottom:16px;">📱</div>
     <h2>Quick Connect</h2>
-    <p>Scan this QR code with your phone to open the scanner instantly. PIN is pre-filled.</p>
+    <p>Scan this QR code with your phone to open the scanner instantly.</p>
     <div id="qrContainer" style="background:white; padding:12px; border-radius:12px; display:inline-block; margin-bottom:20px;">
       <img id="qrImage" src="" style="width:200px; height:200px; display:block;">
     </div>
@@ -1732,14 +2356,23 @@ LEGACY_INDEX_HTML = """
       </div>
     </div>
     <div class="header-right">
-      <button class="btn btn-ghost btn-sm" style="padding:4px 8px; font-size:14px;" onclick="showQr()">📱 QR</button>
-      <select class="camera-sel" id="cameraSel" onchange="switchCamera()">
-        <option>Loading…</option>
-      </select>
-      <div class="user-pill" id="userPill" onclick="changeName()">👤 —</div>
-      <div class="conn-pill" id="connPill" style="background:var(--success-bg); color:var(--success);">
-        <span style="width:6px;height:6px;border-radius:50%;background:var(--success);animation:blink 2s infinite;"></span>
-        <span id="connCount">0</span> online
+      <div class="header-row">
+        <button class="btn btn-ghost btn-sm header-action" onclick="showQr()">📱 QR</button>
+        <select class="camera-sel" id="cameraSel" onchange="switchCamera()">
+          <option>Loading…</option>
+        </select>
+        <div class="conn-pill" id="connPill" style="background:var(--success-bg); color:var(--success);">
+          <span style="width:6px;height:6px;border-radius:50%;background:var(--success);animation:blink 2s infinite;"></span>
+          <span id="connCount">0</span> online
+        </div>
+      </div>
+      <div class="header-row">
+        <div class="auth-pill" id="authPill">Auth required</div>
+        <div class="mode-pill" id="modePill">Inventory • Apple</div>
+        <div class="user-pill" id="userPill" onclick="changeName()">👤 —</div>
+        <div class="settings-pill" id="settingsPill">Prefs local</div>
+        <button class="btn btn-ghost btn-sm header-action" onclick="logoutSession()">Logout</button>
+        <button class="btn btn-ghost btn-sm header-action" onclick="clearAppCache()">Clear Cache</button>
       </div>
     </div>
   </header>
@@ -1766,7 +2399,16 @@ LEGACY_INDEX_HTML = """
           </label>
         </div>
         <div class="card-body">
-          <div id="reader"></div>
+          <div class="reader-shell">
+            <div id="reader"></div>
+            <div class="reader-hud">
+              <div class="reader-hud-row">
+                <span id="perfMode" class="reader-chip">Smart OCR session idle</span>
+                <span id="perfLoad" class="reader-chip">M4 OCR pool 0/0</span>
+              </div>
+              <div class="reader-hud-proc" id="procNote">Ready.</div>
+            </div>
+          </div>
           <div class="func-tabs">
             <button class="func-tab active" id="funcInventoryBtn" onclick="setFunctionMode('inventory')">Check Inventory</button>
             <button class="func-tab" id="funcBoxBtn" onclick="setFunctionMode('box')">Box Counting</button>
@@ -1774,7 +2416,7 @@ LEGACY_INDEX_HTML = """
           </div>
           <div class="mode-summary">
             <div class="mode-title" id="modeTitle">Mode: Check Inventory</div>
-            <div class="mode-sub" id="modeSub">Scan only serials that match check.csv, then save to the selected lane.</div>
+            <div class="mode-sub" id="modeSub">Scan against checklist and save directly into the selected box.</div>
           </div>
           <div class="serial-profile-switch">
             <button class="serial-profile-btn active" id="profileAppleBtn" onclick="setSerialProfile('apple')">Apple Serial</button>
@@ -1789,11 +2431,6 @@ LEGACY_INDEX_HTML = """
             <input class="input-f" id="manualInput" placeholder="Type serial…" onkeydown="if(event.key==='Enter') saveManual()">
             <button class="btn btn-red btn-sm" id="manualSaveBtn" onclick="saveManual()">Save</button>
           </div>
-          <div class="perf-note">
-            <span id="perfMode">Smart OCR session idle</span>
-            <span id="perfLoad">M4 OCR pool 0/0</span>
-          </div>
-          <div class="proc-note" id="procNote">Ready.</div>
           <div class="queue-box">
             <div class="check-box" id="checkBox" style="margin-top:0;padding-top:0;border-top:none;">
               <div class="check-title">Import to check.csv</div>
@@ -1849,18 +2486,6 @@ LEGACY_INDEX_HTML = """
                 <div class="check-preview" id="boxMissingList" style="display:none; max-height:120px; overflow-y:auto; text-align:left; font-size:11px;">-</div>
               </div>
             </div>
-            <div class="queue-head" id="queueHead"><span>Serial Lanes</span><span id="qCount">0</span></div>
-            <div class="queue-controls" id="laneControls">
-              <select class="queue-select" id="laneSel" onchange="onLaneChange()"></select>
-              <input class="queue-input" id="laneInput" placeholder="New lane" onkeydown="if(event.key==='Enter') createLane()">
-              <button class="btn btn-ghost btn-sm" onclick="createLane()">Add</button>
-            </div>
-            <label class="queue-link" id="laneAutoAssignWrap">
-              <input type="checkbox" id="laneAutoAssign" onchange="onLaneAutoAssignChange()">
-              Link scans to selected lane
-            </label>
-            <div class="queue-current" id="qCurrent">No active queue item</div>
-            <div class="queue-list" id="qList"></div>
           </div>
           <div class="banner" id="banner"></div>
         </div>
@@ -1870,14 +2495,13 @@ LEGACY_INDEX_HTML = """
     <!-- Live Feed -->
     <div>
       <div class="card">
-        <div class="card-head">
-          <div class="card-title" id="feedTitle">⚡ Live Feed</div>
-          <div class="head-actions">
-            <button class="btn btn-green btn-sm" onclick="downloadCSV()">⬇ CSV</button>
-            <button class="btn btn-green btn-sm" onclick="downloadLaneCSV()">⬇ Lane CSV</button>
-            <button class="btn btn-green btn-sm" onclick="downloadCropManifest()">⬇ Crops CSV</button>
-            <button class="btn btn-danger btn-sm" onclick="clearAll()">✕ Clear</button>
-          </div>
+          <div class="card-head">
+            <div class="card-title" id="feedTitle">⚡ Live Feed</div>
+            <div class="head-actions">
+              <button class="btn btn-green btn-sm" onclick="downloadCSV()">⬇ CSV</button>
+              <button class="btn btn-green btn-sm" onclick="downloadCropManifest()">⬇ Crops CSV</button>
+              <button class="btn btn-danger btn-sm" onclick="clearAll()">✕ Clear</button>
+            </div>
         </div>
         <div class="card-body">
           <input class="search" id="searchBox" placeholder="Search…" oninput="renderFeed()">
@@ -1975,6 +2599,9 @@ LEGACY_INDEX_HTML = """
   </div>
 </div>
 
+<script src="/static/vendor/socket.io.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
 <script>
 // ============================================
 // State
@@ -1986,8 +2613,9 @@ let scanHistory = [];
 let cameras = [];
 let selectedCam = null;
 let userName = localStorage.getItem('nab_scanner_name') || '';
-let userPin = localStorage.getItem('nab_scanner_user_pin') || '';
+let userPin = '';
 let clientId = localStorage.getItem('nab_scanner_client_id') || '';
+let sessionToken = localStorage.getItem('nab_session_token') || '';
 let joinPin = '';
 let appBootstrapped = false;
 let currentSessionId = '';
@@ -2003,6 +2631,7 @@ let colorIdx = 0;
 let ocrRunning = false;
 let ocrTimer = null;
 let ocrAwaitingServer = false;
+let ocrAwaitTimeoutTimer = null;
 let photoProcessing = false;
 let photoOnlyStream = null;
 const DEFAULT_OCR_DELAY_MS = 700;
@@ -2035,34 +2664,50 @@ let cameraPreference = localStorage.getItem('nab_camera_pref') || 'environment';
 let autosavePref = localStorage.getItem('nab_autosave_pref');
 if (autosavePref !== '0' && autosavePref !== '1') autosavePref = '1';
 let previewCropFilename = '';
-
-function setCookie(name, value, days = 90) {
-  const expires = new Date(Date.now() + (days * 24 * 60 * 60 * 1000)).toUTCString();
-  document.cookie = `${name}=${encodeURIComponent(value || '')}; expires=${expires}; path=/; SameSite=Lax`;
-}
-
-function getCookie(name) {
-  const key = `${name}=`;
-  const parts = (document.cookie || '').split(';');
-  for (const part of parts) {
-    const p = part.trim();
-    if (p.startsWith(key)) return decodeURIComponent(p.slice(key.length));
-  }
-  return '';
-}
+let qrRequestTimer = null;
+let qrRequestInFlight = false;
+let autoBoxCreatePending = false;
+let pendingSocketEmits = [];
+let socketIoClientLoading = false;
+let settingsSyncTimer = null;
+let settingsAppliedFromServer = false;
+let isUserAuthenticated = false;
 
 function saveJoinPin(pin) {
   const val = String(pin || '').trim();
   joinPin = val;
   if (!val) return;
   localStorage.setItem('nab_scanner_pin', val);
-  setCookie('nab_scanner_pin', val, 180);
 }
 
 function clearJoinPinCache() {
   joinPin = '';
   localStorage.removeItem('nab_scanner_pin');
-  setCookie('nab_scanner_pin', '', -1);
+}
+
+function saveSessionToken(token) {
+  const val = String(token || '').trim();
+  sessionToken = val;
+  if (!val) {
+    localStorage.removeItem('nab_session_token');
+    return;
+  }
+  localStorage.setItem('nab_session_token', val);
+}
+
+function clearSessionTokenCache() {
+  sessionToken = '';
+  localStorage.removeItem('nab_session_token');
+}
+
+function resetSocketClient() {
+  try {
+    if (sock) {
+      try { sock.removeAllListeners(); } catch (_e) {}
+      try { sock.disconnect(); } catch (_e) {}
+    }
+  } catch (_e) {}
+  sock = null;
 }
 
 function loadJoinPinCache() {
@@ -2071,26 +2716,176 @@ function loadJoinPinCache() {
     joinPin = fromLocal;
     return fromLocal;
   }
-  const fromCookie = (getCookie('nab_scanner_pin') || '').trim();
-  if (fromCookie) {
-    joinPin = fromCookie;
-    localStorage.setItem('nab_scanner_pin', fromCookie);
-    return fromCookie;
-  }
   joinPin = '';
   return '';
 }
 
 function saveSelectedBox(boxId) {
   const id = String(boxId || '').trim();
+  const changed = selectedBoxId !== id;
   selectedBoxId = id;
   if (id) localStorage.setItem('nab_selected_box_id', id);
   else localStorage.removeItem('nab_selected_box_id');
+  if (changed && settingsAppliedFromServer) scheduleUserSettingsSync();
 }
 
 function loadSelectedBoxCache() {
   const cached = (localStorage.getItem('nab_selected_box_id') || '').trim();
   if (cached) selectedBoxId = cached;
+}
+
+function setSettingsPill(state = 'local', text = '') {
+  const el = document.getElementById('settingsPill');
+  if (!el) return;
+  el.classList.remove('ok', 'warn');
+  if (state === 'ok') el.classList.add('ok');
+  if (state === 'warn') el.classList.add('warn');
+  if (text) {
+    el.textContent = text;
+    return;
+  }
+  if (state === 'ok') el.textContent = 'Prefs synced';
+  else if (state === 'warn') el.textContent = 'Prefs pending';
+  else el.textContent = 'Prefs local';
+}
+
+function setAuthPill(state = 'required', text = '') {
+  const el = document.getElementById('authPill');
+  if (!el) return;
+  el.classList.remove('ok', 'req');
+  if (state === 'ok') el.classList.add('ok');
+  if (state === 'required') el.classList.add('req');
+  if (text) {
+    el.textContent = text;
+    return;
+  }
+  if (state === 'ok') el.textContent = 'Authenticated';
+  else if (state === 'session') el.textContent = 'Join OK • login required';
+  else el.textContent = 'Auth required';
+}
+
+function updateModePill() {
+  const el = document.getElementById('modePill');
+  if (!el) return;
+  const modeMap = {
+    inventory: 'Inventory',
+    box: 'Box',
+    import: 'Import',
+  };
+  const profileMap = {
+    apple: 'Apple',
+    dell: 'Dell',
+  };
+  const modeLabel = modeMap[activeFunction] || 'Inventory';
+  const profileLabel = profileMap[serialProfile] || 'Apple';
+  el.textContent = `${modeLabel} • ${profileLabel}`;
+}
+
+function applyCameraPreferenceToUI() {
+  const sel = document.getElementById('cameraSel');
+  if (!sel) return;
+  const desired = (cameraPreference || 'environment').trim();
+  const hasOption = Array.from(sel.options || []).some((o) => o.value === desired);
+  if (hasOption) {
+    sel.value = desired;
+  } else if (desired === 'environment' || desired === 'user') {
+    sel.value = desired;
+  }
+}
+
+function collectUserSettings() {
+  return {
+    active_function: activeFunction,
+    serial_profile: serialProfile,
+    camera_pref: cameraPreference,
+    autosave_pref: autosavePref,
+    selected_box_id: selectedBoxId || '',
+  };
+}
+
+function scheduleUserSettingsSync() {
+  if (settingsSyncTimer) clearTimeout(settingsSyncTimer);
+  setSettingsPill('warn');
+  settingsSyncTimer = setTimeout(() => {
+    if (!(sock && sock.connected)) return;
+    sock.emit('save_user_settings', { settings: collectUserSettings() });
+  }, 220);
+}
+
+function applyServerSettings(payload, opts = {}) {
+  const s = payload && typeof payload === 'object' ? payload : {};
+  const prevCameraPref = cameraPreference;
+  if (s.active_function === 'inventory' || s.active_function === 'box' || s.active_function === 'import') {
+    activeFunction = s.active_function;
+    localStorage.setItem('nab_active_function', activeFunction);
+  }
+  if (s.serial_profile === 'apple' || s.serial_profile === 'dell') {
+    serialProfile = s.serial_profile;
+    localStorage.setItem('nab_serial_profile', serialProfile);
+  }
+  if (typeof s.camera_pref === 'string' && s.camera_pref.trim()) {
+    cameraPreference = s.camera_pref.trim();
+    localStorage.setItem('nab_camera_pref', cameraPreference);
+  }
+  if (s.autosave_pref === '0' || s.autosave_pref === '1') {
+    autosavePref = s.autosave_pref;
+    localStorage.setItem('nab_autosave_pref', autosavePref);
+  }
+  if (typeof s.selected_box_id === 'string') {
+    saveSelectedBox(s.selected_box_id);
+  }
+  settingsAppliedFromServer = true;
+  if (!opts.skipRender) {
+    updateFunctionModeUI();
+    applyCameraPreferenceToUI();
+    renderBoxes();
+    renderQueue();
+  }
+  updateModePill();
+  if (!opts.skipToast) {
+    setSettingsPill('ok');
+  }
+  if (isScanning && !opts.skipRender && cameraPreference !== prevCameraPref) {
+    // Apply restored camera preference on active scanner with a safe restart.
+    stopScanner().then(() => setTimeout(startScanner, 220));
+  }
+}
+
+async function clearAppCache() {
+  const ok = confirm('Clear local cache and reload?');
+  if (!ok) return;
+  try {
+    Object.keys(localStorage).forEach((k) => {
+      if (k.startsWith('nab_')) localStorage.removeItem(k);
+    });
+    if ('caches' in window) {
+      const names = await caches.keys();
+      await Promise.all(names.map((n) => caches.delete(n)));
+    }
+    if ('serviceWorker' in navigator) {
+      const regs = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(regs.map((r) => r.unregister()));
+    }
+  } catch (_e) {}
+  window.location.href = `${window.location.origin}${window.location.pathname}?v=${Date.now()}`;
+}
+
+function logoutSession() {
+  if (!confirm('Logout current user session?')) return;
+  isUserAuthenticated = false;
+  clearOcrAwaitState();
+  pendingSocketEmits = [];
+  if (isScanning) stopScanner();
+  setAuthPill('required');
+  try { if (sock) sock.emit('logout_session'); } catch (_e) {}
+  resetSocketClient();
+  localStorage.removeItem('nab_scanner_name');
+  localStorage.removeItem('nab_scanner_client_id');
+  clearJoinPinCache();
+  clearSessionTokenCache();
+  setTimeout(() => {
+    window.location.href = `${window.location.origin}${window.location.pathname}?v=${Date.now()}`;
+  }, 180);
 }
 
 function setProcessingState(mode, active, detail = '') {
@@ -2104,6 +2899,27 @@ function setProcessingState(mode, active, detail = '') {
   }
   const label = mode === 'photo' ? 'Processing photo' : 'Processing live frame';
   el.textContent = detail ? `${label} • ${detail}` : `${label}...`;
+}
+
+function clearOcrAwaitState() {
+  if (ocrAwaitTimeoutTimer) {
+    clearTimeout(ocrAwaitTimeoutTimer);
+    ocrAwaitTimeoutTimer = null;
+  }
+  ocrAwaitingServer = false;
+  photoProcessing = false;
+  setProcessingState(processingMode || 'live', false);
+}
+
+function armOcrAwaitTimeout(kind = 'live') {
+  if (ocrAwaitTimeoutTimer) clearTimeout(ocrAwaitTimeoutTimer);
+  ocrAwaitTimeoutTimer = setTimeout(() => {
+    if (!ocrAwaitingServer && !photoProcessing) return;
+    clearOcrAwaitState();
+    const label = kind === 'photo' ? 'photo' : 'live scan';
+    showBanner(`Server response timeout on ${label}. Retrying…`, 'warning');
+    if (isScanning && kind !== 'photo') queueNextOcr(260);
+  }, kind === 'photo' ? 10000 : 7000);
 }
 
 function showScanHold(serial, isDupe, autosaved, cropImage = '', isListed = null) {
@@ -2200,12 +3016,16 @@ function continueAfterScan() {
       const confidence = holdScanPending?.confidence || 0;
       sock.emit('add_to_checklist', { serial: holdScanPending.serial, approved, confidence, serial_profile: serialProfile });
     } else {
+      if (!selectedBoxId) {
+        showBanner('Select or create a box first.', 'warning');
+        return;
+      }
       const payload = { 
         serial: holdScanPending.serial, 
         method: 'camera', 
-        lane: selectedLane, 
         user: userName,
-        box_id: activeFunction === 'box' ? selectedBoxId : null,
+        function_mode: activeFunction,
+        box_id: selectedBoxId || null,
         ocr_confidence: holdScanPending?.confidence || 0,
         crop_image: holdScanPending?.crop_image || ''
       };
@@ -2246,6 +3066,7 @@ function setSerialProfile(profile) {
   if (sock) {
     sock.emit('scanner_state', { scanning: !!isScanning, serial_profile: serialProfile });
   }
+  if (settingsAppliedFromServer) scheduleUserSettingsSync();
 }
 
 function setFunctionMode(mode) {
@@ -2253,12 +3074,14 @@ function setFunctionMode(mode) {
   else activeFunction = 'inventory';
   localStorage.setItem('nab_active_function', activeFunction);
   updateFunctionModeUI();
+  if (settingsAppliedFromServer) scheduleUserSettingsSync();
 }
 
 function onAutosaveChange() {
   const cb = document.getElementById('autosave');
   autosavePref = (cb && cb.checked) ? '1' : '0';
   localStorage.setItem('nab_autosave_pref', autosavePref);
+  if (settingsAppliedFromServer) scheduleUserSettingsSync();
 }
 
 function startImportLive() {
@@ -2277,11 +3100,6 @@ function updateFunctionModeUI() {
   const boxTabBtn = document.getElementById('funcBoxBtn');
   const impBtn = document.getElementById('funcImportBtn');
   const queueBox = document.querySelector('.queue-box');
-  const queueHead = document.getElementById('queueHead');
-  const laneControls = document.getElementById('laneControls');
-  const laneWrap = document.getElementById('laneAutoAssignWrap');
-  const qCurrent = document.getElementById('qCurrent');
-  const qList = document.getElementById('qList');
   const checkBox = document.getElementById('checkBox');
   const boxContainer = document.getElementById('boxContainer');
   const modeTitle = document.getElementById('modeTitle');
@@ -2301,15 +3119,10 @@ function updateFunctionModeUI() {
   if (profileAppleBtn) profileAppleBtn.classList.toggle('active', serialProfile === 'apple');
   if (profileDellBtn) profileDellBtn.classList.toggle('active', serialProfile === 'dell');
 
-  if (queueBox) queueBox.classList.toggle('import-mode', mode !== 'inventory');
-  if (queueHead) queueHead.style.display = mode === 'inventory' ? '' : 'none';
-  if (laneControls) laneControls.style.display = mode === 'inventory' ? '' : 'none';
-  if (laneWrap) laneWrap.style.display = mode === 'inventory' ? '' : 'none';
-  if (qCurrent) qCurrent.style.display = mode === 'inventory' ? '' : 'none';
-  if (qList) qList.style.display = mode === 'inventory' ? '' : 'none';
+  if (queueBox) queueBox.classList.toggle('import-mode', mode === 'import');
   
   if (checkBox) checkBox.style.display = mode === 'import' ? '' : 'none';
-  if (boxContainer) boxContainer.style.display = mode === 'box' ? '' : 'none';
+  if (boxContainer) boxContainer.style.display = mode === 'import' ? 'none' : '';
   if (importActions) importActions.style.display = mode === 'import' ? 'flex' : 'none';
 
   if (modeTitle) {
@@ -2320,7 +3133,7 @@ function updateFunctionModeUI() {
   
   if (modeSub) {
     const profileLabel = serialProfile === 'dell' ? 'Dell Service Tag' : 'Apple Serial';
-    if (mode === 'inventory') modeSub.textContent = `Scan only ${profileLabel} values that match check.csv, then save to lane.`;
+    if (mode === 'inventory') modeSub.textContent = `Scan ${profileLabel} values, check against checklist, and save to selected box.`;
     else if (mode === 'box') modeSub.textContent = `Scan ${profileLabel} values into a specific box. Track missing vs counted.`;
     else modeSub.textContent = `Add ${profileLabel} values to the global check.csv list.`;
   }
@@ -2340,12 +3153,10 @@ function updateFunctionModeUI() {
     if (mode === 'inventory') autosaveCb.checked = autosavePref !== '0';
   }
   
-  if (mode === 'box') {
+  if (mode !== 'import') {
     if (sock) sock.emit('get_boxes');
-  } else if (sock && selectedBoxId) {
-    pendingBoxJoinId = '';
-    sock.emit('box_leave');
   }
+  updateModePill();
 }
 
 function renderQueue() {
@@ -2429,6 +3240,7 @@ function submitPin() {
     return;
   }
   saveJoinPin(pin);
+  resetSocketClient();
   document.getElementById('pinModal').style.display = 'none';
   bootstrapApp();
 }
@@ -2625,11 +3437,23 @@ function beepDupe() { beep(400); setTimeout(() => beep(300), 150); }
 // Socket.IO
 // ============================================
 function initSocket() {
+  if (typeof io === 'undefined') {
+    ensureSocketIoClientLoaded();
+    return false;
+  }
+  if (sock) return true;
   sock = io({
+    transports: ['websocket', 'polling'],
+    reconnection: true,
+    reconnectionAttempts: Infinity,
+    reconnectionDelay: 800,
+    reconnectionDelayMax: 4000,
+    timeout: 10000,
     auth: {
       client_id: clientId,
       name: userName || 'Anonymous',
       pin: joinPin || '',
+      session_token: sessionToken || '',
       serial_profile: serialProfile
     }
   });
@@ -2641,17 +3465,67 @@ function initSocket() {
       return;
     }
     userName = data.name || 'Anonymous';
+    isUserAuthenticated = !!(data && data.authenticated_user);
     if (data.client_id) {
       clientId = data.client_id;
       localStorage.setItem('nab_scanner_client_id', clientId);
     }
+    if (data && data.session_token) saveSessionToken(data.session_token);
     localStorage.setItem('nab_scanner_name', userName);
     document.getElementById('userPill').innerHTML = '👤 ' + esc(userName);
+    if (data && data.settings) {
+      applyServerSettings(data.settings, { skipToast: true });
+    }
+    setAuthPill(isUserAuthenticated ? 'ok' : 'session');
+    setSettingsPill('ok');
+    if (isUserAuthenticated) hideAllIdentityModals();
+    else showAuthChoiceModal();
+  });
+
+  sock.on('session_status', (data) => {
+    const verified = !!(data && data.verified);
+    isUserAuthenticated = !!(data && data.authenticated_user);
+    if (data && data.session_token) saveSessionToken(data.session_token);
+    if (!verified) {
+      clearOcrAwaitState();
+      if (isScanning) stopScanner();
+      setAuthPill('required');
+      showPinModal();
+      return;
+    }
+    if (!isUserAuthenticated) {
+      clearOcrAwaitState();
+      if (isScanning) stopScanner();
+      setAuthPill('session');
+      showAuthChoiceModal();
+      return;
+    }
+    setAuthPill('ok');
     hideAllIdentityModals();
+    sock.emit('scanner_state', { scanning: !!isScanning, serial_profile: serialProfile });
+    sock.emit('load_user_settings');
+    sock.emit('get_boxes');
+    flushPendingSocketEmits();
+  });
+
+  sock.on('user_settings', (data) => {
+    if (!data || !data.ok) {
+      setSettingsPill('warn');
+      return;
+    }
+    applyServerSettings(data.settings || {}, { skipToast: true });
+    setSettingsPill('ok');
   });
 
   sock.on('auth_error', (data) => {
     const reason = data && data.reason ? data.reason : 'auth_error';
+    if (reason === 'not_verified') {
+      clearOcrAwaitState();
+      if (isScanning) stopScanner();
+      showPinModal();
+      toast('Session not verified. Enter join PIN.');
+      return;
+    }
     if (reason === 'invalid_pin') {
       toast('PIN not found. Try again or create new user.');
       showUserPinModal();
@@ -2669,6 +3543,14 @@ function initSocket() {
     }
     if (reason === 'rate_limit') {
       toast('Too many attempts. Wait 1 minute and try again.');
+      return;
+    }
+    if (reason === 'user_auth_required') {
+      clearOcrAwaitState();
+      if (isScanning) stopScanner();
+      setAuthPill('session');
+      toast('Login with user PIN required.');
+      showAuthChoiceModal();
       return;
     }
     toast('Authentication failed.');
@@ -2697,7 +3579,8 @@ function initSocket() {
       connPill.style.color = 'var(--success)';
     }
     sock.emit('session_heartbeat');
-    sock.emit('scanner_state', { scanning: !!isScanning, serial_profile: serialProfile });
+    sock.emit('get_session_status');
+    if (isUserAuthenticated) flushPendingSocketEmits();
   });
 
   sock.on('connect_error', (err) => {
@@ -2710,12 +3593,14 @@ function initSocket() {
     const msg = String((err && (err.message || err.data || '')) || '').toLowerCase();
     const invalidPin = msg.includes('unauthorized') || msg.includes('invalid') || msg.includes('rejected');
     if (invalidPin) {
+      resetSocketClient();
       clearJoinPinCache();
+      clearSessionTokenCache();
       showPinModal();
       toast('Join PIN invalid. Enter PIN again.');
       return;
     }
-    if (!joinPin) {
+    if (!joinPin && !sessionToken) {
       showPinModal();
       const now = Date.now();
       if ((now - lastConnectErrorToastAt) > 4000) {
@@ -2724,6 +3609,7 @@ function initSocket() {
       }
       return;
     }
+    setSettingsPill('warn');
     // Keep previously successful join PIN; do not force re-entry on transient network issues.
     const now = Date.now();
     if ((now - lastConnectErrorToastAt) > 6000) {
@@ -2738,10 +3624,21 @@ function initSocket() {
       connPill.style.background = 'var(--danger-bg)';
       connPill.style.color = 'var(--danger)';
     }
+    clearOcrAwaitState();
+    setAuthPill('required');
+    setSettingsPill('warn');
+  });
+
+  sock.on('logged_out', () => {
+    clearSessionTokenCache();
+    clearOcrAwaitState();
+    setAuthPill('required');
+    setSettingsPill('warn');
   });
 
   sock.on('boxes_updated', (data) => {
     allBoxes = (data && typeof data === 'object') ? data : {};
+    if (Object.keys(allBoxes).length > 0) autoBoxCreatePending = false;
     if (selectedBoxId && !allBoxes[selectedBoxId]) saveSelectedBox('');
     if (!selectedBoxId) {
       const joined = Object.values(allBoxes).find((b) => b && b.joined);
@@ -2763,6 +3660,7 @@ function initSocket() {
       showBanner('Cannot join box right now.', 'warning');
       return;
     }
+    autoBoxCreatePending = false;
     pendingBoxJoinId = '';
     saveSelectedBox(data.box_id || '');
     renderBoxes();
@@ -2790,8 +3688,22 @@ function initSocket() {
   });
 
   sock.on('qr_code_data', (data) => {
-    document.getElementById('qrImage').src = 'data:image/png;base64,' + data.b64;
-    document.getElementById('netUrlText').textContent = data.url;
+    qrRequestInFlight = false;
+    if (qrRequestTimer) {
+      clearTimeout(qrRequestTimer);
+      qrRequestTimer = null;
+    }
+    applyQrData(data || {});
+  });
+
+  sock.on('qr_code_error', (data) => {
+    qrRequestInFlight = false;
+    if (qrRequestTimer) {
+      clearTimeout(qrRequestTimer);
+      qrRequestTimer = null;
+    }
+    const message = (data && data.reason) ? String(data.reason) : 'Failed to load QR';
+    showQrError(message);
   });
 
   // Real-time scan from any user
@@ -2816,9 +3728,7 @@ function initSocket() {
     latestOcrAt = Date.now();
     latestOcrConfidence = typeof data.ocr_confidence === 'number' ? data.ocr_confidence : latestOcrConfidence;
     latestOcrCropImage = lastSubmittedCropImage || latestOcrCropImage || '';
-    ocrAwaitingServer = false;
-    photoProcessing = false;
-    setProcessingState(processingMode || (data && data.source === 'photo' ? 'photo' : 'live'), false);
+    clearOcrAwaitState();
     if (data.source === 'photo' && !isScanning) stopPhotoOnlyStream();
     if (typeof data.next_delay_ms === 'number') ocrDelayMs = data.next_delay_ms;
     updatePerfNote({ status: 'accepted', ...data, accepted: true });
@@ -2827,13 +3737,11 @@ function initSocket() {
   });
 
   sock.on('ocr_policy', (data) => {
-    ocrAwaitingServer = false;
-    setProcessingState(processingMode || (data && data.source === 'photo' ? 'photo' : 'live'), false);
+    clearOcrAwaitState();
     if (data && data.status === 'low_confidence') {
       maybeAutoRefocusByConfidence(data.ocr_confidence);
     }
     if (data && data.source === 'photo') {
-      photoProcessing = false;
       if (!isScanning) stopPhotoOnlyStream();
       if (data.status === 'no_match' || data.status === 'no_text') {
         showBanner('📸 Photo uploaded but no serial found', 'warning');
@@ -3054,7 +3962,6 @@ function submitUserPin() {
 function resetIdentity() {
   if (!confirm('Switch user? This will clear your current identity on this device.')) return;
   localStorage.removeItem('nab_scanner_name');
-  localStorage.removeItem('nab_scanner_user_pin');
   userName = '';
   userPin = '';
   showAuthChoiceModal();
@@ -3072,7 +3979,6 @@ function updateProfile() {
   if (pin) {
     payload.pin = pin;
     userPin = pin;
-    localStorage.setItem('nab_scanner_user_pin', pin);
   }
   
   if (sock) {
@@ -3108,7 +4014,7 @@ function submitBulkImport() {
 // OCR (Text Recognition) Backend Relay
 // ============================================
 async function doOcrFrame() {
-  if (!isScanning || ocrRunning || !sock || ocrAwaitingServer || scanHoldActive) return;
+  if (!isScanning || !isUserAuthenticated || ocrRunning || !sock || ocrAwaitingServer || scanHoldActive) return;
   const video = document.querySelector('#reader video');
   if (!video || video.readyState < 2) return;
 
@@ -3126,11 +4032,12 @@ async function doOcrFrame() {
     lastSubmittedCropImage = b64;
     setProcessingState('live', true);
     ocrAwaitingServer = true;
+    armOcrAwaitTimeout('live');
     sock.emit('process_ocr_frame', { image: b64, serial_profile: serialProfile });
   } catch(e) {
     sock.emit('debug_log', { msg: 'ocr_canvas_error: ' + e.message });
     setProcessingState('live', false);
-    ocrAwaitingServer = false;
+    clearOcrAwaitState();
   }
 
   ocrRunning = false;
@@ -3167,6 +4074,12 @@ async function getVideoElementForPhoto() {
 }
 
 async function capturePhoto() {
+  if (!isUserAuthenticated) {
+    setAuthPill('session');
+    showAuthChoiceModal();
+    toast('Login required before capture.');
+    return;
+  }
   if (!sock || photoProcessing) return;
 
   try {
@@ -3189,10 +4102,11 @@ async function capturePhoto() {
     lastSubmittedCropImage = canvas.toDataURL('image/jpeg', 0.82);
     setProcessingState('photo', true);
     showBanner('📸 Photo captured, processing on server…', 'info');
+    ocrAwaitingServer = true;
+    armOcrAwaitTimeout('photo');
     sock.emit('process_photo_capture', { image: lastSubmittedCropImage, serial_profile: serialProfile });
   } catch (e) {
-    photoProcessing = false;
-    setProcessingState('photo', false);
+    clearOcrAwaitState();
     toast('⚠️ Photo capture failed');
   }
 }
@@ -3253,6 +4167,12 @@ function maybeAutoRefocusByConfidence(confidence) {
 }
 
 async function loadCameras() {
+  if (typeof Html5Qrcode === 'undefined') {
+    const sel = document.getElementById('cameraSel');
+    if (sel) sel.innerHTML = '<option value="environment">Back Camera</option><option value="user">Front Camera</option>';
+    showBanner('Camera module missing. Reload page to continue.', 'warning');
+    return;
+  }
   try {
     cameras = await Html5Qrcode.getCameras();
     const sel = document.getElementById('cameraSel');
@@ -3299,6 +4219,7 @@ function switchCamera() {
   }
   cameraPreference = val;
   localStorage.setItem('nab_camera_pref', cameraPreference);
+  if (settingsAppliedFromServer) scheduleUserSettingsSync();
   if (isScanning) stopScanner().then(() => setTimeout(startScanner, 300));
 }
 
@@ -3306,9 +4227,31 @@ function isMobile() {
   return /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) || window.innerWidth < 600;
 }
 
+function isSecureCameraContext() {
+  const host = window.location.hostname || '';
+  if (window.isSecureContext) return true;
+  if (host === 'localhost' || host === '127.0.0.1' || host === '::1') return true;
+  return false;
+}
+
 function startScanner() {
+  if (typeof Html5Qrcode === 'undefined') {
+    toast('Camera library not loaded. Reload page.');
+    showBanner('Camera engine failed to load. Check internet or refresh browser.', 'warning');
+    return;
+  }
+  if (!isSecureCameraContext()) {
+    showBanner('Camera requires HTTPS on phone browsers. Open HTTPS URL or localhost.', 'warning');
+    toast('Camera blocked on HTTP (browser security policy)');
+    return;
+  }
   document.getElementById('reader').innerHTML = '';
-  scanner = new Html5Qrcode('reader');
+  try {
+    scanner = new Html5Qrcode('reader');
+  } catch (e) {
+    toast('⚠️ Camera init failed: ' + (e && e.message ? e.message : e));
+    return;
+  }
   
   let cfg;
   if (useFacingMode) {
@@ -3346,15 +4289,22 @@ function startScanner() {
     if (sock) sock.emit('scanner_state', { scanning: true, serial_profile: serialProfile });
     refocusCamera(true);
     queueNextOcr(200);
-  }).catch(e => toast('⚠️ Camera: ' + e));
+  }).catch(e => {
+    const msg = String((e && e.message) ? e.message : e || '');
+    if (msg.toLowerCase().includes('permission')) {
+      showBanner('Camera permission denied. Allow camera in browser settings.', 'warning');
+    } else if (msg.toLowerCase().includes('secure') || msg.toLowerCase().includes('https')) {
+      showBanner('Camera needs HTTPS on phone. Use https://... or install cert.', 'warning');
+    }
+    toast('⚠️ Camera: ' + msg);
+  });
 }
 
 function stopScanner() {
   return new Promise(r => {
     if (ocrTimer) { clearTimeout(ocrTimer); ocrTimer = null; }
     hideScanHold();
-    ocrAwaitingServer = false;
-    setProcessingState('live', false);
+    clearOcrAwaitState();
     if (scanner && isScanning) {
       scanner.stop().then(() => {
         isScanning = false;
@@ -3377,6 +4327,8 @@ function stopScanner() {
       r();
     }
   });
+
+  return true;
 }
 
 // ============================================
@@ -3391,6 +4343,7 @@ function onScan(decoded, meta = {}) {
   }
   refreshChecksetIfStale();
   if (scanHoldActive) return;
+  if (!requireSelectedBox('scanning')) return;
   const normalized = normalizeClientSerial(decoded, serialProfile);
   if (!isLikelySerialForProfile(normalized, serialProfile)) return;
   if (activeFunction === 'inventory' && allowedCheckSet.size > 0 && !allowedCheckSet.has(normalized)) {
@@ -3406,7 +4359,7 @@ function onScan(decoded, meta = {}) {
   const isDupe = dupeCount > 0;
   const listedInCheckCsv = allowedCheckSet.size > 0 && allowedCheckSet.has(normalized);
   const listedInBoxCsv = (
-    activeFunction === 'box'
+    activeFunction !== 'import'
     && !!selectedBoxId
     && !!allBoxes[selectedBoxId]
     && Array.isArray(allBoxes[selectedBoxId].target)
@@ -3432,7 +4385,7 @@ function onScan(decoded, meta = {}) {
 
   const autosaveEnabled = !!document.getElementById('autosave')?.checked;
   if (autosaveEnabled && activeFunction === 'inventory') {
-    emitSave(normalized, meta.source === 'barcode' ? 'camera' : 'camera', selectedLane, true);
+    emitSave(normalized, meta.source === 'barcode' ? 'camera' : 'camera');
     if (scanner && isScanning) {
       try { scanner.resume(); } catch(e) {}
       queueNextOcr(180);
@@ -3443,19 +4396,19 @@ function onScan(decoded, meta = {}) {
   showScanHold(normalized, isDupe, true, latestOcrCropImage, isListedInCsv);
 }
 
-function emitSave(serial, method, lane = null, forceLane = false) {
+function emitSave(serial, method) {
   if (!sock) return;
+  if (!requireSelectedBox('saving')) return;
   const payload = { 
     serial: serial.trim(), 
     method, 
     user: userName,
-    box_id: activeFunction === 'box' ? selectedBoxId : null,
+    function_mode: activeFunction,
+    box_id: selectedBoxId || null,
     ocr_confidence: latestOcrConfidence || 0,
     crop_image: latestOcrCropImage || '',
     serial_profile: serialProfile
   };
-  if (forceLane && lane) payload.lane = lane;
-  else if (laneAutoAssign) payload.lane = selectedLane;
   sock.emit('save_scan', payload);
 }
 
@@ -3467,12 +4420,13 @@ function saveManual() {
   if (activeFunction === 'import') {
     sock.emit('add_to_checklist', { serial, manual: true, serial_profile: serialProfile });
   } else {
+    if (!requireSelectedBox('manual save')) return;
     const payload = { 
       serial, 
       method: 'manual', 
-      lane: selectedLane, 
       user: userName,
-      box_id: activeFunction === 'box' ? selectedBoxId : null,
+      function_mode: activeFunction,
+      box_id: selectedBoxId || null,
       ocr_confidence: 0,
       crop_image: '',
       serial_profile: serialProfile
@@ -3540,11 +4494,15 @@ function isTypingInInputTarget(target) {
 // QR Access
 // ============================================
 function showQr() {
-  if (!sock) return;
-  sock.emit('get_qr_code');
   document.getElementById('qrModal').style.display = 'grid';
+  requestQrCode();
 }
 function closeQr() {
+  if (qrRequestTimer) {
+    clearTimeout(qrRequestTimer);
+    qrRequestTimer = null;
+  }
+  qrRequestInFlight = false;
   document.getElementById('qrModal').style.display = 'none';
 }
 function copyUrl() {
@@ -3557,6 +4515,200 @@ function copyUrl() {
   document.execCommand('copy');
   document.body.removeChild(temp);
   toast('URL copied to clipboard');
+}
+
+function setQrLoading(loading, note = 'Generating QR…') {
+  const img = document.getElementById('qrImage');
+  const text = document.getElementById('netUrlText');
+  if (img) {
+    if (loading) {
+      img.removeAttribute('src');
+      img.style.opacity = '0.45';
+    } else {
+      img.style.opacity = '1';
+    }
+  }
+  if (text && loading) text.textContent = note;
+}
+
+function requireSocketReady(actionLabel = 'This action') {
+  if (!joinPin && !sessionToken) {
+    showPinModal();
+    showBanner(`Enter join PIN before ${actionLabel.toLowerCase()}.`, 'warning');
+    return false;
+  }
+  if (typeof io === 'undefined') {
+    ensureSocketIoClientLoaded();
+    showBanner('Loading client libraries… retrying shortly.', 'warning');
+    return true;
+  }
+  if (!sock) {
+    try {
+      initSocket();
+      showBanner(`Starting scanner session for ${actionLabel.toLowerCase()}…`, 'info');
+      setTimeout(() => {
+        try {
+          if (sock && !sock.connected) sock.connect();
+        } catch (_e) {}
+      }, 120);
+      return true;
+    } catch (_e) {
+      showBanner(`${actionLabel} queued while starting session…`, 'warning');
+      return true;
+    }
+  }
+  if (sock.connected) {
+    if (!isUserAuthenticated) {
+      try { sock.emit('get_session_status'); } catch (_e) {}
+      setAuthPill('session');
+      showAuthChoiceModal();
+    }
+    return true;
+  }
+  try { sock.connect(); } catch (_e) {}
+  showBanner(`${actionLabel} queued while reconnecting…`, 'warning');
+  return true;
+}
+
+function ensureSocketIoClientLoaded() {
+  if (typeof io !== 'undefined') return;
+  if (socketIoClientLoading) return;
+  socketIoClientLoading = true;
+  const sources = [
+    '/static/vendor/socket.io.min.js',
+    'https://cdn.jsdelivr.net/npm/socket.io-client@4.8.1/dist/socket.io.min.js',
+    'https://unpkg.com/socket.io-client@4.8.1/dist/socket.io.min.js',
+  ];
+  const tryLoad = (index) => {
+    if (index >= sources.length) {
+      socketIoClientLoading = false;
+      showBanner('Failed loading socket client. Check connection and retry.', 'warning');
+      return;
+    }
+    const script = document.createElement('script');
+    script.src = sources[index];
+    script.async = true;
+    script.crossOrigin = 'anonymous';
+    script.onload = () => {
+      socketIoClientLoading = false;
+      try {
+        if (!sock) initSocket();
+        else if (!sock.connected) sock.connect();
+        showBanner('Client libraries loaded.', 'info');
+      } catch (_e) {
+        showBanner('Session reconnect failed. Please reload page.', 'warning');
+      }
+    };
+    script.onerror = () => tryLoad(index + 1);
+    document.head.appendChild(script);
+  };
+  tryLoad(0);
+}
+
+function emitWhenConnected(event, payload, actionLabel = 'Action') {
+  if (sock && sock.connected && isUserAuthenticated) {
+    sock.emit(event, payload);
+    return true;
+  }
+  pendingSocketEmits.push({ event, payload });
+  if (sock && sock.connected && !isUserAuthenticated) {
+    setAuthPill('session');
+    showAuthChoiceModal();
+  }
+  requireSocketReady(actionLabel);
+  return false;
+}
+
+function flushPendingSocketEmits() {
+  if (!(sock && sock.connected) || !isUserAuthenticated || !pendingSocketEmits.length) return;
+  const queued = pendingSocketEmits.slice();
+  pendingSocketEmits = [];
+  queued.forEach((item) => {
+    try { sock.emit(item.event, item.payload); } catch (_e) {}
+  });
+}
+
+function requireSelectedBox(actionLabel = 'scan') {
+  if (activeFunction === 'import') return true;
+  if (selectedBoxId && allBoxes[selectedBoxId]) return true;
+  const ids = Object.keys(allBoxes || {});
+  if (ids.length > 0) {
+    const first = ids[0];
+    saveSelectedBox(first);
+    if (sock && sock.connected) {
+      try { joinBox(first); } catch (_e) {}
+    }
+    showBanner(`Using box: ${allBoxes[first]?.name || first}`, 'info');
+    return true;
+  }
+  if (sock && sock.connected && !autoBoxCreatePending) {
+    autoBoxCreatePending = true;
+    try {
+      sock.emit('box_create', { name: 'General', serial_profile: serialProfile });
+      showBanner('No box found. Creating General box…', 'info');
+    } catch (_e) {}
+    setTimeout(() => { autoBoxCreatePending = false; }, 2000);
+  }
+  showBanner(`Select or create a box before ${actionLabel}.`, 'warning');
+  return false;
+}
+
+function showQrError(message) {
+  const txt = document.getElementById('netUrlText');
+  if (txt) txt.textContent = message || 'Failed to generate QR';
+  toast(message || 'QR request failed');
+}
+
+function applyQrData(data) {
+  const img = document.getElementById('qrImage');
+  const txt = document.getElementById('netUrlText');
+  if (!img || !txt) return;
+  const url = String(data.url || '').trim();
+  const b64 = String(data.b64 || '').trim();
+  txt.textContent = url || `${window.location.protocol}//${window.location.host}/`;
+  if (b64) {
+    img.src = `data:image/png;base64,${b64}`;
+    img.style.opacity = '1';
+  } else {
+    img.removeAttribute('src');
+    img.style.opacity = '0.45';
+    if (data.reason) toast(data.reason);
+  }
+}
+
+async function requestQrCode() {
+  if (qrRequestInFlight) return;
+  qrRequestInFlight = true;
+  setQrLoading(true);
+  const fallbackFetch = async () => {
+    try {
+      const res = await fetch('/qr-data', { cache: 'no-store' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      applyQrData(data || {});
+    } catch (e) {
+      showQrError('QR not available. Use copied URL.');
+    } finally {
+      qrRequestInFlight = false;
+      setQrLoading(false);
+    }
+  };
+  // Prefer HTTP fetch first so QR still works even when socket is reconnecting.
+  if (!(sock && sock.connected)) {
+    await fallbackFetch();
+    return;
+  }
+  if (sock && sock.connected) {
+    try {
+      sock.emit('get_qr_code');
+    } catch (_e) {
+      await fallbackFetch();
+      return;
+    }
+    qrRequestTimer = setTimeout(() => { fallbackFetch(); }, 1800);
+    return;
+  }
+  await fallbackFetch();
 }
 
 // ============================================
@@ -3573,7 +4725,7 @@ function closeBoxCreate() {
 function submitBoxCreate() {
   const name = document.getElementById('boxNameInput').value.trim();
   if (!name) return;
-  sock.emit('box_create', { name, serial_profile: serialProfile });
+  emitWhenConnected('box_create', { name, serial_profile: serialProfile }, 'Create box');
   closeBoxCreate();
 }
 
@@ -3589,7 +4741,7 @@ function submitBoxImport() {
   if (!selectedBoxId) return;
   const text = document.getElementById('boxImportInput').value.trim();
   if (!text) return;
-  sock.emit('box_import_target', { box_id: selectedBoxId, text, serial_profile: serialProfile });
+  emitWhenConnected('box_import_target', { box_id: selectedBoxId, text, serial_profile: serialProfile }, 'Import target list');
   closeBoxImport();
 }
 
@@ -3597,25 +4749,26 @@ function onBoxChange() {
   const sel = document.getElementById('boxSel');
   if (!sel) return;
   const nextId = sel.value || '';
-  if (!nextId || !sock) return;
+  if (!nextId) return;
+  if (!requireSocketReady('Switch box')) return;
   saveSelectedBox(nextId);
   joinBox(nextId);
 }
 
 function joinBox(boxId) {
-  if (!sock || !boxId) return;
+  if (!boxId) return;
   if (pendingBoxJoinId === boxId) return;
   const alreadyJoined = allBoxes[boxId] && allBoxes[boxId].joined;
   if (alreadyJoined && selectedBoxId === boxId) return;
   pendingBoxJoinId = boxId;
-  sock.emit('box_join', { box_id: boxId });
+  emitWhenConnected('box_join', { box_id: boxId }, 'Join box');
 }
 
 function toggleBoxClosed() {
-  if (!selectedBoxId || !sock) return;
+  if (!selectedBoxId) return;
   const box = allBoxes[selectedBoxId];
   if (!box) return;
-  sock.emit('box_set_closed', { box_id: selectedBoxId, closed: !box.closed });
+  emitWhenConnected('box_set_closed', { box_id: selectedBoxId, closed: !box.closed }, 'Update box');
 }
 
 function downloadBoxSummary() {
@@ -3729,7 +4882,7 @@ function toggleBoxMissing() {
 function deleteActiveBox() {
   if (!selectedBoxId) return;
   if (!confirm('Permanently delete this box and its count data?')) return;
-  sock.emit('box_delete', { box_id: selectedBoxId });
+  emitWhenConnected('box_delete', { box_id: selectedBoxId }, 'Delete box');
 }
 
 // ============================================
@@ -3803,12 +4956,10 @@ function renderFeed() {
     return;
   }
 
-  const activeLane = selectedLane || 'General';
   const grouped = new Map();
   for (const h of scanHistory) {
     if (!h || !h.serial) continue;
     const rowLane = h.lane || 'General';
-    if (activeLane !== 'All' && rowLane !== activeLane) continue;
     const key = h.serial;
     if (!grouped.has(key)) {
       grouped.set(key, {
@@ -3841,10 +4992,8 @@ function renderFeed() {
 
     if (!items.length) {
       if (countEl) countEl.textContent = '0 items';
-      const laneHint = (!q && activeLane !== 'All' && !laneAutoAssign)
-        ? `No scans in lane ${esc(activeLane)}. Enable "Link scans to selected lane" to save into this lane.`
-        : `No scans in lane ${esc(activeLane)}`;
-      el.innerHTML = `<div class="feed-empty"><div class="icon">${q?'🔍':'📡'}</div>${q?'No matches':laneHint}</div>`;
+      const noDataHint = 'No scanned serials yet';
+      el.innerHTML = `<div class="feed-empty"><div class="icon">${q?'🔍':'📡'}</div>${q?'No matches':noDataHint}</div>`;
       return;
     }
     if (countEl) countEl.textContent = `${items.length} items`;
@@ -4012,13 +5161,6 @@ async function refreshChecksetIfStale(maxAgeMs = 20000) {
 // ============================================
 async function bootstrapApp() {
   if (appBootstrapped) return;
-  
-  // Handle auto-login via URL param ?p=... (JOIN_PIN)
-  const urlParams = new URLSearchParams(window.location.search);
-  const p = urlParams.get('p');
-  if (p && !joinPin) {
-    saveJoinPin(p);
-  }
 
   if (!joinPin) {
     showPinModal();
@@ -4030,8 +5172,15 @@ async function bootstrapApp() {
     document.getElementById('userPill').innerHTML = '👤 ' + esc(userName);
   }
   await loadCameras();
+  if (!isSecureCameraContext()) {
+    showBanner('Camera on mobile needs HTTPS. HTTP mode can block camera access.', 'warning');
+  }
   await loadCheckset();
-  initSocket();
+  if (!initSocket()) {
+    appBootstrapped = false;
+    showBanner('Loading realtime client…', 'warning');
+    return;
+  }
   updateFunctionModeUI();
   renderQueue();
   setInterval(() => { loadCheckset(); }, 30000);
@@ -4060,18 +5209,19 @@ async function bootstrapApp() {
     }
   });
   toast('✅ Native M4 OCR Link Active');
-
-  // Clean URL if we used a PIN
-  if (p) {
-    const cleanUrl = window.location.protocol + "//" + window.location.host + window.location.pathname;
-    window.history.replaceState({path:cleanUrl}, '', cleanUrl);
-  }
 }
 
 function init() {
   loadJoinPinCache();
   loadSelectedBoxCache();
-  if (joinPin === '2026') {
+  if (!sessionToken) {
+    const st = (localStorage.getItem('nab_session_token') || '').trim();
+    if (st) sessionToken = st;
+  }
+  setSettingsPill('local');
+  setAuthPill((joinPin || sessionToken) ? 'session' : 'required');
+  updateModePill();
+  if (joinPin || sessionToken) {
     bootstrapApp();
     return;
   }
@@ -4235,7 +5385,12 @@ def set_security_headers(resp):
     resp.headers["X-Frame-Options"] = "DENY"
     resp.headers["Referrer-Policy"] = "no-referrer"
     # Local scanner UI should never be cached by intermediaries.
-    if request.path == "/" or request.path.startswith("/checkset"):
+    if (
+        request.path == "/"
+        or request.path.startswith("/checkset")
+        or request.path.startswith("/qr-data")
+        or request.path.startswith("/health")
+    ):
         resp.headers["Cache-Control"] = "no-store"
     return resp
 
@@ -4262,12 +5417,32 @@ def checkset():
 def health():
     return jsonify({
         "ok": True,
+        "build": APP_BUILD_ID,
         "users_online": len(connected_users),
         "active_scanners": get_active_scanner_count(),
         "ocr_inflight": ocr_inflight,
         "ocr_capacity": OCR_MAX_INFLIGHT,
         "boxes": len(box_registry),
     })
+
+
+def build_network_url():
+    local_ip = get_local_ip()
+    port = 5000
+    force_http = os.environ.get("DISABLE_SSL", "").lower() in {"1", "true", "yes", "on"}
+    cert = os.path.join(BASE_DIR, "cert.pem")
+    key = os.path.join(BASE_DIR, "key.pem")
+    has_ssl = (not force_http) and os.path.isfile(cert) and os.path.isfile(key)
+    scheme = "https" if has_ssl else "http"
+    return f"{scheme}://{local_ip}:{port}/"
+
+
+@app.route("/qr-data")
+def qr_data():
+    url = build_network_url()
+    qr_b64 = get_qr_base64(url)
+    reason = "" if qr_b64 else "QR image unavailable on server; use URL copy."
+    return jsonify({"url": url, "b64": qr_b64, "reason": reason})
 
 
 @app.route("/download/lane/<path:lane_name>")
@@ -4410,12 +5585,44 @@ def download_cert():
 def on_connect(auth=None):
     ip = request.remote_addr or "unknown"
     auth = auth or {}
-    client_id = (auth.get("client_id") or "").strip()
+    client_id = re.sub(r"[^A-Za-z0-9._:-]", "", (auth.get("client_id") or "").strip())[:64]
+    join_pin = str(auth.get("pin", "")).strip()
+    auth_session_token = str(auth.get("session_token", "")).strip()
     serial_profile = normalize_serial_profile(auth.get("serial_profile", DEFAULT_SERIAL_PROFILE))
-    
-    # Allow initial connection; verification via PIN pad
+    token_client_id = verify_session_token(auth_session_token)
+    if token_client_id:
+        client_id = token_client_id
+    load_user_registry()
+    pin_user_client_id = None
+    pin_user_profile = None
+    is_join_pin = join_pin_matches(join_pin)
+    if (not token_client_id) and (not is_join_pin) and join_pin:
+        pin_user_client_id, pin_user_profile = find_user_by_pin(join_pin)
+    if not token_client_id and not is_join_pin and not pin_user_client_id:
+        raise ConnectionRefusedError("unauthorized")
+
+    if pin_user_client_id:
+        client_id = pin_user_client_id
+
+    authenticated_user = bool(
+        (token_client_id and token_client_id in user_registry)
+        or pin_user_client_id
+    )
+    if pin_user_profile and isinstance(pin_user_profile, dict):
+        profile = pin_user_profile
+    else:
+        profile = user_registry.get(client_id, {}) if (client_id and authenticated_user) else {}
+    display_name = ((profile.get("name") or "Anonymous").strip() or "Anonymous") if authenticated_user else "Anonymous"
+    user_settings = db_ensure_user_settings(client_id) if (client_id and authenticated_user) else dict(DEFAULT_USER_SETTINGS)
+    serial_profile = normalize_serial_profile(user_settings.get("serial_profile", serial_profile))
+
+    if client_id and authenticated_user:
+        previous_sid = client_session_index.get(client_id)
+        if previous_sid and previous_sid != request.sid:
+            remove_session(previous_sid)
+
     connected_users[request.sid] = {
-        "name": "Anonymous",
+        "name": display_name,
         "ip": ip,
         "connected_at": now_hms(),
         "last_active_at": now_hms(),
@@ -4423,11 +5630,15 @@ def on_connect(auth=None):
         "client_id": client_id,
         "serial_profile": serial_profile,
         "session_state": "idle",
-        "verified": False
+        "verified": True,
+        "authenticated_user": authenticated_user,
+        "settings": user_settings,
     }
     
     if client_id:
-        client_session_index[client_id] = request.sid
+        if authenticated_user:
+            client_session_index[client_id] = request.sid
+            db_touch_login(client_id)
         
     client_ocr_state[request.sid] = {
         "scanning": False,
@@ -4441,27 +5652,16 @@ def on_connect(auth=None):
     }
 
     emit("identity_status", {
-        "verified": False,
-        "mode": "pin_required"
+        "verified": True,
+        "name": display_name,
+        "client_id": client_id,
+        "authenticated_user": authenticated_user,
+        "session_token": issue_session_token(client_id) if authenticated_user else "",
+        "settings": user_settings,
     }, to=request.sid)
 
     broadcast_users()
-    
-    # Send history to the new client
-    rows = read_csv_rows()
-    sync_lane_state_from_rows(rows)
-    history = [{
-        "serial": r.get("Serial Number",""),
-        "timestamp": r.get("Timestamp",""),
-        "method": r.get("Scanned By",""),
-        "user": r.get("User",""),
-        "lane": r.get("Lane","General") or "General",
-        "checked": matches_checklist_any(r.get("Serial Number","")),
-    } for r in rows]
-    history.reverse()
-    emit("history_data", history)
-    emit("lanes_data", lanes_snapshot(), to=request.sid)
-    emit_boxes_updated(request.sid)
+    emit_initial_data_for_sid(request.sid)
     emit_ocr_policy(request.sid, status="ready", accepted=True)
     emit("session_registered", {"sid": request.sid}, to=request.sid)
     emit("ocr_dashboard", get_ocr_dashboard_snapshot())
@@ -4470,6 +5670,7 @@ def on_connect(auth=None):
 
 @socketio.on("authenticate_pin")
 def on_authenticate_pin(data):
+    data = data or {}
     ip = request.remote_addr or "unknown"
     pin = str(data.get("pin", "")).strip()
     if not is_reasonable_pin(pin):
@@ -4481,9 +5682,20 @@ def on_authenticate_pin(data):
         return
 
     # Check for Session JOIN PIN
-    if pin == JOIN_PIN:
+    if join_pin_matches(pin):
         record_auth_success(ip)
+        if request.sid in connected_users:
+            connected_users[request.sid]["verified"] = True
+            connected_users[request.sid]["authenticated_user"] = is_user_authenticated_session(request.sid)
+        emit_initial_data_for_sid(request.sid)
         emit("auth_result", {"success": True, "type": "session"}, to=request.sid)
+        emit("session_status", {
+            "verified": True,
+            "authenticated_user": bool(connected_users.get(request.sid, {}).get("authenticated_user")),
+            "requires_user_auth": not bool(connected_users.get(request.sid, {}).get("authenticated_user")),
+            "session_token": issue_session_token(connected_users.get(request.sid, {}).get("client_id")) if bool(connected_users.get(request.sid, {}).get("authenticated_user")) else "",
+        }, to=request.sid)
+        broadcast_users()
         return
 
     # Check for User Profile PIN
@@ -4491,15 +5703,24 @@ def on_authenticate_pin(data):
     matched_client_id, matched_profile = find_user_by_pin(pin)
     if matched_client_id:
         record_auth_success(ip)
+        user_settings = db_ensure_user_settings(matched_client_id)
         if request.sid in connected_users:
             connected_users[request.sid]["name"] = matched_profile.get("name", "Anonymous")
             connected_users[request.sid]["verified"] = True
             connected_users[request.sid]["client_id"] = matched_client_id
-            
+            connected_users[request.sid]["authenticated_user"] = True
+            connected_users[request.sid]["settings"] = user_settings
+            connected_users[request.sid]["serial_profile"] = normalize_serial_profile(
+                user_settings.get("serial_profile", connected_users[request.sid].get("serial_profile", DEFAULT_SERIAL_PROFILE))
+            )
+        client_session_index[matched_client_id] = request.sid
+        emit_initial_data_for_sid(request.sid)
         emit("auth_result", {
             "success": True, 
             "type": "user",
-            "user": {"name": matched_profile.get("name", "Anonymous")}
+            "user": {"name": matched_profile.get("name", "Anonymous")},
+            "session_token": issue_session_token(matched_client_id),
+            "settings": user_settings,
         }, to=request.sid)
         broadcast_users()
         return
@@ -4524,6 +5745,8 @@ def on_disconnect():
 
 @socketio.on("set_name")
 def on_set_name(data):
+    if not require_verified_session():
+        return
     # This is now mostly handled via register_user
     name = data.get("name", "Anonymous").strip()
     if request.sid in connected_users:
@@ -4538,11 +5761,12 @@ def on_set_name(data):
 
 @socketio.on("register_user")
 def on_register_user(data):
+    data = data or {}
     ip = request.remote_addr or "unknown"
     if not check_auth_rate_limit(ip):
         emit("auth_error", {"reason": "rate_limit"}, to=request.sid)
         return
-    client_id = data.get("client_id")
+    client_id = re.sub(r"[^A-Za-z0-9._:-]", "", str((data or {}).get("client_id") or "").strip())[:64]
     name = data.get("name", "Anonymous").strip()
     pin = str(data.get("pin", "")).strip()
     if not client_id:
@@ -4563,21 +5787,30 @@ def on_register_user(data):
     
     save_user_to_registry(client_id, name, pin)
     record_auth_success(ip)
+    user_settings = db_ensure_user_settings(client_id)
     if request.sid in connected_users:
         connected_users[request.sid]["name"] = name
         connected_users[request.sid]["verified"] = True
         connected_users[request.sid]["client_id"] = client_id
+        connected_users[request.sid]["authenticated_user"] = True
+        connected_users[request.sid]["settings"] = user_settings
+        connected_users[request.sid]["serial_profile"] = normalize_serial_profile(
+            user_settings.get("serial_profile", connected_users[request.sid].get("serial_profile", DEFAULT_SERIAL_PROFILE))
+        )
         box_id = sid_box_membership.get(request.sid)
         if box_id and box_id in box_live_presence and request.sid in box_live_presence[box_id]:
             box_live_presence[box_id][request.sid]["name"] = name
+    client_session_index[client_id] = request.sid
     
-    emit("identity_status", {"verified": True, "name": name, "client_id": client_id}, to=request.sid)
+    emit("identity_status", {"verified": True, "name": name, "client_id": client_id, "authenticated_user": True, "session_token": issue_session_token(client_id), "settings": user_settings}, to=request.sid)
+    emit_initial_data_for_sid(request.sid)
     broadcast_users()
     emit_boxes_updated()
 
 
 @socketio.on("login_with_pin")
 def on_login_with_pin(data):
+    data = data or {}
     ip = request.remote_addr or "unknown"
     if not check_auth_rate_limit(ip):
         emit("auth_error", {"reason": "rate_limit"}, to=request.sid)
@@ -4605,18 +5838,30 @@ def on_login_with_pin(data):
         connected_users[request.sid]["name"] = matched_profile.get("name", "Anonymous")
         connected_users[request.sid]["verified"] = True
         connected_users[request.sid]["client_id"] = matched_client_id
+        connected_users[request.sid]["authenticated_user"] = True
+        user_settings = db_ensure_user_settings(matched_client_id)
+        connected_users[request.sid]["settings"] = user_settings
+        connected_users[request.sid]["serial_profile"] = normalize_serial_profile(
+            user_settings.get("serial_profile", connected_users[request.sid].get("serial_profile", DEFAULT_SERIAL_PROFILE))
+        )
     client_session_index[matched_client_id] = request.sid
+    db_touch_login(matched_client_id)
     emit("identity_status", {
         "verified": True,
         "name": matched_profile.get("name", "Anonymous"),
         "client_id": matched_client_id,
+        "authenticated_user": True,
+        "session_token": issue_session_token(matched_client_id),
+        "settings": db_ensure_user_settings(matched_client_id),
     }, to=request.sid)
+    emit_initial_data_for_sid(request.sid)
     broadcast_users()
     emit_boxes_updated()
 
 
 @socketio.on("update_profile")
 def on_update_profile(data):
+    data = data or {}
     if request.sid not in connected_users or not connected_users[request.sid].get("verified"):
         return
     
@@ -4630,6 +5875,7 @@ def on_update_profile(data):
     load_user_registry()
     if client_id in user_registry:
         if name:
+            db_update_user_name(client_id, name)
             user_registry[client_id]["name"] = name
             connected_users[request.sid]["name"] = name
         if pin:
@@ -4640,18 +5886,17 @@ def on_update_profile(data):
             if existing_client_id:
                 emit("auth_error", {"reason": "pin_in_use"}, to=request.sid)
                 return
-            user_registry[client_id]["pin_hash"] = hash_pin(pin)
-            user_registry[client_id].pop("pin", None)
-        
-        try:
-            with data_lock:
-                atomic_write_json(USERS_FILE, user_registry)
-        except Exception as e:
-            print(f"-> Error saving user registry update: {e}")
+            new_hash = hash_pin(pin)
+            db_update_user_pin(client_id, new_hash)
+            user_registry[client_id]["pin_hash"] = new_hash
+
         emit("identity_status", {
             "verified": True,
             "name": user_registry[client_id]["name"],
             "client_id": client_id,
+            "authenticated_user": True,
+            "session_token": issue_session_token(client_id),
+            "settings": db_ensure_user_settings(client_id),
         }, to=request.sid)
         broadcast_users()
         emit_boxes_updated()
@@ -4672,8 +5917,73 @@ def on_session_heartbeat():
         emit_boxes_updated()
 
 
+@socketio.on("get_session_status")
+def on_get_session_status():
+    user = connected_users.get(request.sid, {}) or {}
+    authenticated_user = is_user_authenticated_session(request.sid)
+    if request.sid in connected_users:
+        connected_users[request.sid]["authenticated_user"] = authenticated_user
+    emit("session_status", {
+        "verified": bool(user.get("verified")),
+        "authenticated_user": authenticated_user,
+        "requires_user_auth": bool(user.get("verified")) and not authenticated_user,
+        "name": user.get("name", "Anonymous"),
+        "client_id": user.get("client_id", ""),
+        "session_token": issue_session_token(user.get("client_id", "")) if authenticated_user else "",
+    }, to=request.sid)
+
+
+@socketio.on("logout_session")
+def on_logout_session():
+    if request.sid in connected_users:
+        emit("logged_out", {"ok": True}, to=request.sid)
+    remove_session(request.sid)
+    broadcast_users()
+    broadcast_ocr_dashboard()
+    disconnect(sid=request.sid)
+
+
+@socketio.on("load_user_settings")
+def on_load_user_settings():
+    if not require_verified_session():
+        return
+    user = connected_users.get(request.sid) or {}
+    client_id = str(user.get("client_id") or "").strip()
+    settings = db_ensure_user_settings(client_id) if client_id else dict(DEFAULT_USER_SETTINGS)
+    if request.sid in connected_users:
+        connected_users[request.sid]["settings"] = settings
+        connected_users[request.sid]["serial_profile"] = normalize_serial_profile(
+            settings.get("serial_profile", connected_users[request.sid].get("serial_profile", DEFAULT_SERIAL_PROFILE))
+        )
+    emit("user_settings", {"ok": True, "settings": settings}, to=request.sid)
+
+
+@socketio.on("save_user_settings")
+def on_save_user_settings(data):
+    if not require_verified_session():
+        return
+    user = connected_users.get(request.sid) or {}
+    client_id = str(user.get("client_id") or "").strip()
+    if not client_id:
+        emit("user_settings", {"ok": False, "reason": "missing_client"}, to=request.sid)
+        return
+    incoming = (data or {}).get("settings") or {}
+    settings = db_save_user_settings(client_id, incoming)
+    if request.sid in connected_users:
+        connected_users[request.sid]["settings"] = settings
+        connected_users[request.sid]["serial_profile"] = normalize_serial_profile(
+            settings.get("serial_profile", connected_users[request.sid].get("serial_profile", DEFAULT_SERIAL_PROFILE))
+        )
+    state = client_ocr_state.get(request.sid)
+    if state is not None:
+        state["serial_profile"] = connected_users[request.sid].get("serial_profile", state.get("serial_profile", DEFAULT_SERIAL_PROFILE))
+    emit("user_settings", {"ok": True, "settings": settings}, to=request.sid)
+
+
 @socketio.on("scanner_state")
 def on_scanner_state(data):
+    if not require_verified_session():
+        return
     state = client_ocr_state.get(request.sid)
     if state is None:
         return
@@ -4696,6 +6006,8 @@ def on_scanner_state(data):
 @socketio.on("process_photo_capture")
 def on_process_photo_capture(data):
     global ocr_inflight
+    if not require_verified_session():
+        return
     state = client_ocr_state.get(request.sid)
     if state is None:
         emit_ocr_policy(
@@ -4774,8 +6086,11 @@ def on_process_photo_capture(data):
 
 @socketio.on("save_scan")
 def on_save_scan(data):
+    if not require_verified_session():
+        return
     ensure_csv_schema()
     serial_profile = get_sid_serial_profile(request.sid, (data or {}).get("serial_profile"))
+    function_mode = str((data or {}).get("function_mode") or "").strip().lower()
     if request.sid in connected_users:
         connected_users[request.sid]["serial_profile"] = serial_profile
     serial = normalize_serial_candidate(data.get("serial", "").strip(), serial_profile)
@@ -4783,7 +6098,6 @@ def on_save_scan(data):
     user = data.get("user", "Anonymous")
     ocr_confidence = float((data or {}).get("ocr_confidence", 0.0) or 0.0)
     crop_image = (data or {}).get("crop_image")
-    lane = ensure_lane(data.get("lane"))
     active_box = str((data or {}).get("box_id") or "").strip()
     if active_box:
         if active_box not in box_registry:
@@ -4792,13 +6106,19 @@ def on_save_scan(data):
         if box_registry[active_box].get("closed"):
             emit("save_rejected", {"serial": serial, "reason": "box_closed"}, to=request.sid)
             return
+    if active_box and active_box in box_registry:
+        box_name = (box_registry[active_box].get("name") or f"Box-{active_box}").strip()
+        lane = ensure_lane((data or {}).get("lane") or box_name)
+    else:
+        lane = ensure_lane((data or {}).get("lane"))
     if not allow_serial(serial, serial_profile):
         emit("save_rejected", {
             "serial": serial,
             "reason": f"non_{serial_profile}_serial" if serial_profile in {"apple", "dell"} else "invalid_serial",
         }, to=request.sid)
         return
-    if not matches_checklist(serial, serial_profile):
+    enforce_checklist = function_mode != "box" and not bool(active_box)
+    if enforce_checklist and not matches_checklist(serial, serial_profile):
         emit("save_rejected", {
             "serial": serial,
             "reason": "not_in_checklist",
@@ -4902,6 +6222,8 @@ def on_save_scan(data):
 @socketio.on("queue_add")
 def on_queue_add(data):
     global lane_next_id
+    if not require_verified_session():
+        return
     serial_profile = get_sid_serial_profile(request.sid, (data or {}).get("serial_profile"))
     serial = normalize_serial_candidate((data or {}).get("serial", "").strip(), serial_profile)
     user = ((data or {}).get("user") or connected_users.get(request.sid, {}).get("name") or "Anonymous").strip()
@@ -4924,6 +6246,8 @@ def on_queue_add(data):
 
 @socketio.on("queue_update_current")
 def on_queue_update_current(data):
+    if not require_verified_session():
+        return
     serial_profile = get_sid_serial_profile(request.sid, (data or {}).get("serial_profile"))
     serial = normalize_serial_candidate((data or {}).get("serial", "").strip(), serial_profile)
     user = ((data or {}).get("user") or connected_users.get(request.sid, {}).get("name") or "Anonymous").strip()
@@ -4944,6 +6268,8 @@ def on_queue_update_current(data):
 
 @socketio.on("lane_create")
 def on_lane_create(data):
+    if not require_verified_session():
+        return
     lane = normalize_lane_name((data or {}).get("lane"))
     if not lane:
         emit("queue_rejected", {"reason": "invalid_lane"}, to=request.sid)
@@ -4954,6 +6280,8 @@ def on_lane_create(data):
 
 @socketio.on("add_to_checklist")
 def on_add_to_checklist(data):
+    if not require_verified_session():
+        return
     serial_profile = get_sid_serial_profile(request.sid, (data or {}).get("serial_profile"))
     serial = normalize_serial_candidate((data or {}).get("serial", "").strip(), serial_profile)
     approved = bool((data or {}).get("approved"))
@@ -4973,6 +6301,8 @@ def on_add_to_checklist(data):
 
 @socketio.on("delete_scan")
 def on_delete_scan(data):
+    if not require_verified_session():
+        return
     serial = data.get("serial", "")
     timestamp = data.get("timestamp", "")
     rows = read_csv_rows()
@@ -4992,6 +6322,8 @@ def on_delete_scan(data):
 
 @socketio.on("clear_all")
 def on_clear_all():
+    if not require_verified_session():
+        return
     with data_lock:
         with open(CSV_FILE, "w", newline="") as f:
             csv.writer(f).writerow(CSV_HEADERS)
@@ -5003,6 +6335,8 @@ def on_clear_all():
 
 @socketio.on("bulk_import_checklist")
 def on_bulk_import_checklist(data):
+    if not require_verified_session():
+        return
     text = (data or {}).get("text", "").strip()
     if not text:
         return
@@ -5035,24 +6369,24 @@ def on_bulk_import_checklist(data):
 
 @socketio.on("get_qr_code")
 def on_get_qr_code():
-    local_ip = get_local_ip()
-    port = 5000 # Could pull from global but hardcoded for now
-    force_http = os.environ.get("DISABLE_SSL", "").lower() in {"1", "true", "yes", "on"}
-    cert = os.path.join(BASE_DIR, "cert.pem")
-    key = os.path.join(BASE_DIR, "key.pem")
-    has_ssl = (not force_http) and os.path.isfile(cert) and os.path.isfile(key)
-    scheme = "https" if has_ssl else "http"
-    
-    # Include PIN if possible
-    pin_param = f"?p={JOIN_PIN}" if JOIN_PIN else ""
-    net_url = f"{scheme}://{local_ip}:{port}/{pin_param}"
-    
+    if not require_verified_session():
+        return
+    net_url = build_network_url()
     qr_b64 = get_qr_base64(net_url)
-    emit("qr_code_data", {"url": net_url, "b64": qr_b64}, to=request.sid)
+    if qr_b64:
+        emit("qr_code_data", {"url": net_url, "b64": qr_b64}, to=request.sid)
+        return
+    emit("qr_code_data", {
+        "url": net_url,
+        "b64": "",
+        "reason": "QR image unavailable on server; use URL copy.",
+    }, to=request.sid)
 
 
 @socketio.on("box_create")
 def on_box_create(data):
+    if not require_verified_session():
+        return
     name = (data or {}).get("name", "").strip()
     if not name: return
     serial_profile = get_sid_serial_profile(request.sid, (data or {}).get("serial_profile"))
@@ -5074,6 +6408,8 @@ def on_box_create(data):
 
 @socketio.on("box_import_target")
 def on_box_import_target(data):
+    if not require_verified_session():
+        return
     box_id = (data or {}).get("box_id")
     text = (data or {}).get("text", "").strip()
     if not box_id or box_id not in box_registry or not text: return
@@ -5097,6 +6433,8 @@ def on_box_import_target(data):
 
 @socketio.on("box_delete")
 def on_box_delete(data):
+    if not require_verified_session():
+        return
     box_id = (data or {}).get("box_id")
     if box_id in box_registry:
         for sid, joined_box in list(sid_box_membership.items()):
@@ -5110,6 +6448,8 @@ def on_box_delete(data):
 
 @socketio.on("box_join")
 def on_box_join(data):
+    if not require_verified_session():
+        return
     box_id = str((data or {}).get("box_id") or "").strip()
     if not box_id or box_id not in box_registry:
         emit("box_joined", {"ok": False, "reason": "box_not_found"}, to=request.sid)
@@ -5125,12 +6465,16 @@ def on_box_join(data):
 
 @socketio.on("box_leave")
 def on_box_leave():
+    if not require_verified_session():
+        return
     leave_box_for_sid(request.sid, notify=True)
     emit("box_joined", {"ok": True, "box_id": None}, to=request.sid)
 
 
 @socketio.on("box_set_closed")
 def on_box_set_closed(data):
+    if not require_verified_session():
+        return
     box_id = str((data or {}).get("box_id") or "").strip()
     closed = bool((data or {}).get("closed"))
     if not box_id or box_id not in box_registry:
@@ -5144,6 +6488,8 @@ def on_box_set_closed(data):
 
 @socketio.on("get_boxes")
 def on_get_boxes():
+    if not require_verified_session():
+        return
     load_box_registry()
     emit_boxes_updated(request.sid)
 
@@ -5158,6 +6504,8 @@ frame_counts = {}
 def handle_ocr_frame(data):
     global ocr_inflight
     sid = request.sid
+    if not require_verified_session():
+        return
     state = client_ocr_state.get(sid)
     if state is None:
         emit_ocr_policy(sid, status="idle", accepted=False, next_delay_ms=get_recommended_ocr_interval_ms(250))
@@ -5385,6 +6733,7 @@ if __name__ == "__main__":
 
     try:
         ensure_csv_schema()
+        init_database()
         load_check_serials()
         ensure_crop_storage()
         load_user_registry()
@@ -5392,7 +6741,7 @@ if __name__ == "__main__":
         rows = read_csv_rows()
         sync_lane_state_from_rows(rows)
         write_lane_csv_files(rows)
-        for p in (CSV_FILE, CHECK_FILE, USERS_FILE, BOXES_FILE, CROPS_MANIFEST_FILE):
+        for p in (CSV_FILE, CHECK_FILE, USERS_FILE, DB_FILE, BOXES_FILE, CROPS_MANIFEST_FILE):
             if os.path.isfile(p):
                 secure_chmod(p)
     except Exception as e:
@@ -5404,4 +6753,4 @@ if __name__ == "__main__":
         socketio.run(app, host="0.0.0.0", port=PORT, debug=False,
                      keyfile=KEY, certfile=CERT, log=QuietWSGI())
     else:
-        socketio.run(app, host="0.0.0.0", port=PORT, debug=False)
+        socketio.run(app, host="0.0.0.0", port=PORT, debug=False, log=QuietWSGI())

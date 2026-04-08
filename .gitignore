@@ -10,6 +10,11 @@ venv/
 # Local credentials
 cert.pem
 key.pem
+.scanner_secret
 
 # Local runtime data
 *.log
+scanner.db
+scanner.db-shm
+scanner.db-wal
+*.bak.*
