@@ -8,10 +8,11 @@
       "C02H80P8Q05P",
       "C02GP0RXQ05P",
       "HY0Z8Y3",
-      "C02GP0TPQ05P"
+      "C02GP0TPQ05P",
+      "C02GP0TP005P"
     ],
     "user": "Max",
-    "last_active": "2026-04-08 17:59:25",
+    "last_active": "2026-04-08 18:01:06",
     "closed": false,
     "audit": [
       {
@@ -72,9 +73,21 @@
         "in_target": false,
         "duplicate_in_box": false,
         "sid": "8jdHqlo0ULEm4QyyAAA1",
+        "ip": "10.242.26.141"
+      },
+      {
+        "serial": "C02GP0TP005P",
+        "serial_profile": "apple",
+        "user": "Nam",
+        "method": "camera",
+        "lane": "A",
+        "timestamp": "2026-04-08 18:01:06",
+        "in_target": false,
+        "duplicate_in_box": false,
+        "sid": "5nF92mzI4Gi3NHEhAAA9",
         "ip": "10.242.26.141",
-        "crop_file": "C02GP0TPQ05P__20260408_175925_000.jpg",
-        "crop_latest_file": "C02GP0TPQ05P.jpg"
+        "crop_file": "C02GP0TP005P__20260408_180106_000.jpg",
+        "crop_latest_file": "C02GP0TP005P.jpg"
       }
     ]
   }

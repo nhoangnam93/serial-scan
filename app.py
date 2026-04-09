@@ -2319,110 +2319,46 @@ html, body {
 
 <div class="scan-flash" id="scanFlash"></div>
 
-<!-- PIN Modal -->
-<div class="modal-bg" id="pinModal" style="display:none;">
+<!-- Unified Login Modal -->
+<div class="modal-bg" id="unifiedAuthModal" style="display:none;">
   <div class="modal">
-    <div style="font-size:36px; margin-bottom:12px;">🔐</div>
-    <h2>Join Scanner</h2>
-    <p>Enter join PIN to access this session</p>
-    <input type="password" id="pinInput" placeholder="PIN"
-           onkeydown="if(event.key==='Enter') submitPin()" autofocus>
-    <button class="btn btn-red" onclick="submitPin()">Join</button>
-  </div>
-</div>
-
-<!-- Name Modal (Registration) -->
-<div class="modal-bg" id="nameModal" style="display:none;">
-  <div class="modal">
-    <div style="font-size:42px; margin-bottom:16px;">👤</div>
-    <h2>Create New User</h2>
-    <p>Set display name and unique personal PIN</p>
-    <div style="display:flex; flex-direction:column; gap:12px; margin-bottom:20px;">
-      <input type="text" id="nameInput" placeholder="Enter your name" 
-             style="margin-bottom:0;" onkeydown="if(event.key==='Enter') document.getElementById('regPinInput').focus()">
-      <input type="password" id="regPinInput" placeholder="Set a personal PIN" 
-             style="margin-bottom:0;" onkeydown="if(event.key==='Enter') document.getElementById('regPinConfirmInput').focus()">
-      <input type="password" id="regPinConfirmInput" placeholder="Confirm PIN" 
-             style="margin-bottom:0;" onkeydown="if(event.key==='Enter') registerUser()">
+    <!-- Step 1: PIN Entry -->
+    <div id="authStep1">
+      <div style="font-size:42px; margin-bottom:16px;">🔐</div>
+      <h2>NAB Scanner</h2>
+      <p>Enter your PIN to sign in</p>
+      <input type="password" id="unifiedPinInput" placeholder="PIN"
+             onkeydown="if(event.key==='Enter') submitUnifiedPin()" autofocus>
+      <div id="authError" style="display:none; margin-bottom:12px; padding:8px 12px; border-radius:8px; background:var(--danger-bg); color:var(--danger); font-size:12px; font-weight:600; animation:bannerIn 0.3s ease;"></div>
+      <button class="btn btn-red" id="authSubmitBtn" onclick="submitUnifiedPin()">Sign In</button>
     </div>
-    <div style="margin-bottom:12px; font-size:12px; color:var(--text3);">
-      Have an existing PIN? <a href="#" onclick="showAuthChoiceModal(); return false;" style="color:var(--info); text-decoration:none;">Use Existing PIN</a>
-    </div>
-    <button class="btn btn-red" onclick="registerUser()">Create Profile</button>
-  </div>
-</div>
-
-<div class="modal-bg" id="authChoiceModal" style="display:none;">
-  <div class="modal">
-    <div style="font-size:42px; margin-bottom:16px;">🔐</div>
-    <h2>Sign In</h2>
-    <p>Choose how you want to continue</p>
-    <div style="display:flex; flex-direction:column; gap:10px;">
-      <button class="btn btn-red" onclick="showUserPinModal()">Use Existing PIN</button>
-      <button class="btn btn-ghost" onclick="showNameModal()">Create New User</button>
+    <!-- Step 2: New User Registration (shown after join PIN) -->
+    <div id="authStep2" style="display:none;">
+      <div style="font-size:42px; margin-bottom:16px;">👤</div>
+      <h2>Create Profile</h2>
+      <p>Set your name and a personal PIN to sign in next time</p>
+      <div style="display:flex; flex-direction:column; gap:12px; margin-bottom:20px;">
+        <input type="text" id="nameInput" placeholder="Your name"
+               style="margin-bottom:0;" onkeydown="if(event.key==='Enter') document.getElementById('regPinInput').focus()">
+        <input type="password" id="regPinInput" placeholder="Create personal PIN"
+               style="margin-bottom:0;" onkeydown="if(event.key==='Enter') document.getElementById('regPinConfirmInput').focus()">
+        <input type="password" id="regPinConfirmInput" placeholder="Confirm PIN"
+               style="margin-bottom:0;" onkeydown="if(event.key==='Enter') registerUser()">
+      </div>
+      <div id="regError" style="display:none; margin-bottom:12px; padding:8px 12px; border-radius:8px; background:var(--danger-bg); color:var(--danger); font-size:12px; font-weight:600; animation:bannerIn 0.3s ease;"></div>
+      <button class="btn btn-red" onclick="registerUser()">Create Profile</button>
+      <div style="margin-top:12px;">
+        <a href="#" onclick="showAuthStep1(); return false;" style="color:var(--text3); text-decoration:none; font-size:12px;">← Back to PIN</a>
+      </div>
     </div>
   </div>
 </div>
 
-<!-- QR Modal -->
-<div class="modal-bg" id="qrModal" style="display:none;" onclick="if(event.target===this) closeQr()">
-  <div class="modal">
-    <div style="font-size:42px; margin-bottom:16px;">📱</div>
-    <h2>Quick Connect</h2>
-    <p>Scan this QR code with your phone to open the scanner instantly.</p>
-    <div id="qrContainer" style="background:white; padding:12px; border-radius:12px; display:inline-block; margin-bottom:20px;">
-      <img id="qrImage" src="" style="width:200px; height:200px; display:block;">
-    </div>
-    <div style="margin-bottom:20px;">
-      <code id="netUrlText" style="display:block; font-size:11px; color:var(--text3); word-break:break-all; margin-bottom:8px;"></code>
-      <button class="btn btn-ghost btn-sm" onclick="copyUrl()">📋 Copy URL</button>
-    </div>
-    <button class="btn btn-red" onclick="closeQr()">Done</button>
-  </div>
-</div>
-
-<!-- Box Create Modal -->
-<div class="modal-bg" id="boxCreateModal" style="display:none;" onclick="if(event.target===this) closeBoxCreate()">
-  <div class="modal">
-    <div style="font-size:42px; margin-bottom:16px;">📦</div>
-    <h2>Create New Box</h2>
-    <p>Give this box/container a name to start tracking</p>
-    <input type="text" id="boxNameInput" placeholder="Box Name (e.g. Pallet A)" 
-           style="margin-bottom:20px;" onkeydown="if(event.key==='Enter') submitBoxCreate()">
-    <div style="display:flex; gap:10px;">
-      <button class="btn btn-ghost" onclick="closeBoxCreate()">Cancel</button>
-      <button class="btn btn-red" onclick="submitBoxCreate()">Create Box</button>
-    </div>
-  </div>
-</div>
-
-<!-- Box Import Modal -->
-<div class="modal-bg" id="boxImportModal" style="display:none;" onclick="if(event.target===this) closeBoxImport()">
-  <div class="modal">
-    <div style="font-size:42px; margin-bottom:16px;">📄</div>
-    <h2>Import Target List</h2>
-    <p>Paste the list of serials expected in this box</p>
-    <textarea id="boxImportInput" placeholder="Serial numbers..."
-              style="width:100%; height:160px; border-radius:12px; border:1px solid var(--border); background:var(--bg-input); color:var(--text); padding:12px; font-family:'JetBrains Mono',monospace; font-size:13px; outline:none; margin-bottom:18px;"></textarea>
-    <div style="display:flex; gap:10px;">
-      <button class="btn btn-ghost" onclick="closeBoxImport()">Cancel</button>
-      <button class="btn btn-red" id="boxImportSubmitBtn" onclick="submitBoxImport()">Import List</button>
-    </div>
-  </div>
-</div>
-<div class="modal-bg" id="userPinModal" style="display:none;">
-  <div class="modal">
-    <div style="font-size:42px; margin-bottom:16px;">👋</div>
-    <h2 id="userPinTitle">Use Existing PIN</h2>
-    <p>Enter PIN to load that user profile</p>
-    <input type="password" id="userPinInput" placeholder="Your PIN" 
-           style="margin-bottom:20px;" onkeydown="if(event.key==='Enter') submitUserPin()">
-    <button class="btn btn-red" onclick="submitUserPin()">Unlock</button>
-    <div style="margin-top:16px; font-size:12px; color:var(--text3);">
-      No profile yet? <a href="#" onclick="showNameModal(); return false;" style="color:var(--info); text-decoration:none;">Create new user</a>
-    </div>
-  </div>
-</div>
+<!-- Legacy modal IDs kept as hidden for JS compatibility -->
+<div id="pinModal" style="display:none;"></div>
+<div id="nameModal" style="display:none;"></div>
+<div id="authChoiceModal" style="display:none;"></div>
+<div id="userPinModal" style="display:none;"></div>
 
 <!-- Profile Modal (Edit User Info) -->
 <div class="modal-bg" id="profileModal" style="display:none;" onclick="if(event.target===this) closeProfile()">
@@ -3634,24 +3570,71 @@ function createLane() {
   renderFeed();
 }
 
-function showPinModal() {
-  document.getElementById('pinModal').style.display = 'grid';
-  setTimeout(() => document.getElementById('pinInput').focus(), 100);
+function showUnifiedAuth() {
+  document.getElementById('unifiedAuthModal').style.display = 'grid';
+  showAuthStep1();
 }
 
-function submitPin() {
-  const input = document.getElementById('pinInput');
+function showAuthStep1() {
+  document.getElementById('authStep1').style.display = '';
+  document.getElementById('authStep2').style.display = 'none';
+  const err = document.getElementById('authError');
+  if (err) err.style.display = 'none';
+  const input = document.getElementById('unifiedPinInput');
+  if (input) { input.value = ''; setTimeout(() => input.focus(), 100); }
+}
+
+function showAuthStep2() {
+  document.getElementById('authStep1').style.display = 'none';
+  document.getElementById('authStep2').style.display = '';
+  const err = document.getElementById('regError');
+  if (err) err.style.display = 'none';
+  setTimeout(() => document.getElementById('nameInput').focus(), 100);
+}
+
+function showAuthError(msg) {
+  const el = document.getElementById('authError');
+  if (!el) return;
+  el.textContent = msg;
+  el.style.display = 'block';
+  const input = document.getElementById('unifiedPinInput');
+  if (input) { input.value = ''; input.focus(); }
+}
+
+function showRegError(msg) {
+  const el = document.getElementById('regError');
+  if (!el) return;
+  el.textContent = msg;
+  el.style.display = 'block';
+}
+
+function hideUnifiedAuth() {
+  document.getElementById('unifiedAuthModal').style.display = 'none';
+}
+
+// Unified PIN submission: enter PIN → server decides what to do
+function submitUnifiedPin() {
+  const input = document.getElementById('unifiedPinInput');
   const pin = (input.value || '').trim();
   if (!pin) {
-    input.value = '';
-    toast('Enter PIN');
+    showAuthError('Enter your PIN');
     return;
   }
+  // Clear ALL cached credentials so the entered PIN is the sole credential
+  clearSessionTokenCache();
+  clearJoinPinCache();
+  isUserAuthenticated = false;
+  appBootstrapped = false;
+  // Save entered PIN as the join pin
   saveJoinPin(pin);
+  // Always disconnect and reconnect fresh with just this PIN
   resetSocketClient();
-  document.getElementById('pinModal').style.display = 'none';
   bootstrapApp();
 }
+
+// Legacy compatibility wrappers
+function showPinModal() { showUnifiedAuth(); }
+function submitPin() { submitUnifiedPin(); }
 
 function updatePerfNote(data) {
   if (!data) return;
@@ -3963,10 +3946,38 @@ function initSocket() {
   });
   syncSocketAuthPayload();
 
+  sock.on('auth_result', (data) => {
+    if (!data) return;
+    if (data.success && data.type === 'session') {
+      // Join PIN accepted — session verified, show user registration
+      showAuthStep2();
+      return;
+    }
+    if (data.success && data.type === 'user') {
+      // User PIN matched — login complete
+      userName = (data.user && data.user.name) || 'Anonymous';
+      isUserAuthenticated = true;
+      localStorage.setItem('nab_scanner_name', userName);
+      if (data.session_token) saveSessionToken(data.session_token);
+      if (data.settings) applyServerSettings(data.settings, { skipToast: true });
+      document.getElementById('userPill').innerHTML = '👤 ' + esc(userName);
+      setAuthPill('ok');
+      setSettingsPill('ok');
+      hideAllIdentityModals();
+      updateCaptureControls();
+      maybeAutoStartScanner('auth');
+      toast('✅ Welcome back, ' + userName);
+      return;
+    }
+    if (!data.success) {
+      showUnifiedAuth();
+      showAuthError(data.reason === 'rate_limit' ? 'Too many attempts. Wait 1 minute.' : 'Invalid PIN. Try again.');
+    }
+  });
+
   sock.on('identity_status', (data) => {
     if (!data || !data.verified) {
-      if (data && data.has_profile_on_device) showUserPinModal();
-      else showAuthChoiceModal();
+      showUnifiedAuth();
       return;
     }
     userName = data.name || 'Anonymous';
@@ -3984,9 +3995,13 @@ function initSocket() {
     setAuthPill(isUserAuthenticated ? 'ok' : 'session');
     setSettingsPill('ok');
     updateCaptureControls();
-    if (isUserAuthenticated) maybeAutoStartScanner('identity');
-    if (isUserAuthenticated) hideAllIdentityModals();
-    else showAuthChoiceModal();
+    if (isUserAuthenticated) {
+      maybeAutoStartScanner('identity');
+      hideAllIdentityModals();
+    } else {
+      // Connected but no user profile → show registration step
+      showAuthStep2();
+    }
   });
 
   sock.on('session_status', (data) => {
@@ -3997,7 +4012,7 @@ function initSocket() {
       clearOcrAwaitState();
       if (isScanning) stopScanner();
       setAuthPill('required');
-      showPinModal();
+      showUnifiedAuth();
       updateCaptureControls();
       return;
     }
@@ -4005,7 +4020,7 @@ function initSocket() {
       clearOcrAwaitState();
       if (isScanning) stopScanner();
       setAuthPill('session');
-      showAuthChoiceModal();
+      showAuthStep2();
       updateCaptureControls();
       return;
     }
@@ -4033,39 +4048,39 @@ function initSocket() {
     if (reason === 'not_verified') {
       clearOcrAwaitState();
       if (isScanning) stopScanner();
-      showPinModal();
-      toast('Session not verified. Enter join PIN.');
+      showUnifiedAuth();
+      showAuthError('Session expired. Enter PIN again.');
       return;
     }
     if (reason === 'invalid_pin') {
-      toast('PIN not found. Try again or create new user.');
-      showUserPinModal();
+      showUnifiedAuth();
+      showAuthError('Invalid PIN. Try again.');
       return;
     }
     if (reason === 'pin_in_use') {
-      toast('PIN already used by another user. Choose different PIN.');
-      showNameModal();
+      showAuthStep2();
+      showRegError('PIN already in use. Choose a different personal PIN.');
       return;
     }
     if (reason === 'missing_fields') {
-      toast('Name and PIN are required.');
-      showNameModal();
+      showAuthStep2();
+      showRegError('Name and PIN are required.');
       return;
     }
     if (reason === 'rate_limit') {
-      toast('Too many attempts. Wait 1 minute and try again.');
+      showUnifiedAuth();
+      showAuthError('Too many attempts. Wait 1 minute.');
       return;
     }
     if (reason === 'user_auth_required') {
       clearOcrAwaitState();
       if (isScanning) stopScanner();
       setAuthPill('session');
-      toast('Login with user PIN required.');
-      showAuthChoiceModal();
+      showUnifiedAuth();
       return;
     }
-    toast('Authentication failed.');
-    showAuthChoiceModal();
+    showUnifiedAuth();
+    showAuthError('Authentication failed. Try again.');
   });
 
   sock.on('profile_updated', (data) => {
@@ -4110,24 +4125,18 @@ function initSocket() {
       resetSocketClient();
       clearJoinPinCache();
       clearSessionTokenCache();
-      showPinModal();
-      toast('Join PIN invalid. Enter PIN again.');
+      showUnifiedAuth();
+      showAuthError('Invalid PIN. Try again.');
       return;
     }
     if (!joinPin && !sessionToken) {
-      showPinModal();
-      const now = Date.now();
-      if ((now - lastConnectErrorToastAt) > 4000) {
-        toast('Join PIN required');
-        lastConnectErrorToastAt = now;
-      }
+      showUnifiedAuth();
       return;
     }
     setSettingsPill('warn');
-    // Keep previously successful join PIN; do not force re-entry on transient network issues.
     const now = Date.now();
     if ((now - lastConnectErrorToastAt) > 6000) {
-      toast('Connection lost. Retrying with saved join PIN…');
+      toast('Connection lost. Retrying…');
       lastConnectErrorToastAt = now;
     }
   });
@@ -4421,26 +4430,10 @@ function initSocket() {
 // ============================================
 // Identity & Profile
 // ============================================
-function showNameModal() {
-  hideAllIdentityModals();
-  const p1 = document.getElementById('regPinInput');
-  const p2 = document.getElementById('regPinConfirmInput');
-  if (p1) p1.value = '';
-  if (p2) p2.value = '';
-  document.getElementById('nameModal').style.display = 'grid';
-  setTimeout(() => document.getElementById('nameInput').focus(), 150);
-}
-
-function showAuthChoiceModal() {
-  hideAllIdentityModals();
-  document.getElementById('authChoiceModal').style.display = 'grid';
-}
-
-function showUserPinModal() {
-  hideAllIdentityModals();
-  document.getElementById('userPinModal').style.display = 'grid';
-  setTimeout(() => document.getElementById('userPinInput').focus(), 150);
-}
+// Legacy wrappers → all redirect to unified auth modal
+function showNameModal() { showUnifiedAuth(); showAuthStep2(); }
+function showAuthChoiceModal() { showUnifiedAuth(); }
+function showUserPinModal() { showUnifiedAuth(); }
 
 function showProfileModal() {
   document.getElementById('profNameInput').value = userName;
@@ -4454,6 +4447,8 @@ function closeProfile() {
 }
 
 function hideAllIdentityModals() {
+  hideUnifiedAuth();
+  // Also hide legacy stubs
   document.getElementById('authChoiceModal').style.display = 'none';
   document.getElementById('nameModal').style.display = 'none';
   document.getElementById('userPinModal').style.display = 'none';
@@ -4465,11 +4460,11 @@ function registerUser() {
   const pin = document.getElementById('regPinInput').value.trim();
   const pinConfirm = (document.getElementById('regPinConfirmInput')?.value || '').trim();
   if (!name || !pin || !pinConfirm) {
-    toast('Name and PIN required');
+    showRegError('Name and PIN are required.');
     return;
   }
   if (pin !== pinConfirm) {
-    toast('PIN confirmation does not match');
+    showRegError('PIN confirmation does not match.');
     return;
   }
   
@@ -4479,14 +4474,8 @@ function registerUser() {
 }
 
 function submitUserPin() {
-  const input = document.getElementById('userPinInput');
-  const pin = input.value.trim();
-  if (!pin) return;
-  
-  userPin = pin;
-  if (sock) {
-    sock.emit('login_with_pin', { pin });
-  }
+  // Legacy compatibility — redirect to unified auth
+  showUnifiedAuth();
 }
 
 function resetIdentity() {
@@ -4494,7 +4483,7 @@ function resetIdentity() {
   localStorage.removeItem('nab_scanner_name');
   userName = '';
   userPin = '';
-  showAuthChoiceModal();
+  showUnifiedAuth();
 }
 
 function updateProfile() {
@@ -5761,7 +5750,7 @@ async function bootstrapApp() {
   if (appBootstrapped) return;
 
   if (!joinPin && !sessionToken) {
-    showPinModal();
+    showUnifiedAuth();
     return;
   }
 
@@ -5837,7 +5826,7 @@ function init() {
     bootstrapApp();
     return;
   }
-  showPinModal();
+  showUnifiedAuth();
 }
 init();
 </script>
