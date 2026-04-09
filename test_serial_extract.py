@@ -1,6 +1,11 @@
 import unittest
 
-from serial_parser import extract_serial_from_text, is_likely_dell_service_tag, is_likely_macbook_serial
+from serial_parser import (
+    extract_serial_from_text,
+    is_likely_dell_service_tag,
+    is_likely_macbook_serial,
+    is_valid_serial_candidate_for_profile,
+)
 
 
 class SerialExtractTests(unittest.TestCase):
@@ -40,6 +45,16 @@ class SerialExtractTests(unittest.TestCase):
     def test_rejects_random_noise_without_label_hints(self):
         text = "ZXCVB12345 asdf qwer 10.242.28.11 online users"
         self.assertEqual(extract_serial_from_text(text), "")
+
+    def test_rejects_keyboard_word_false_positive(self):
+        text = "G B H N J K L M command option"
+        self.assertEqual(extract_serial_from_text(text), "")
+
+    def test_prefers_actual_apple_serial_over_model_serial_artifact(self):
+        text = "California Model A3112 a Serial JFXK6LM6P6"
+        self.assertEqual(extract_serial_from_text(text), "JFXK6LM6P6")
+        self.assertFalse(is_valid_serial_candidate_for_profile("A3112ASER1AL", "apple"))
+        self.assertFalse(is_valid_serial_candidate_for_profile("A3112SEMBLED", "apple"))
 
     def test_extracts_dell_service_tag_from_st_prefix(self):
         text = "DELL Reg Model ST:BNKGR44 EX:25369701700"

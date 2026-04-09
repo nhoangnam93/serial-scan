@@ -85,6 +85,20 @@ def _build_threshold_variant(img_bytes):
         return b""
 
 
+def _build_rotated_variant(img_bytes, degrees):
+    try:
+        deg = int(degrees) % 360
+        if deg == 0:
+            return img_bytes
+        with Image.open(BytesIO(img_bytes)) as im:
+            rot = im.rotate(-deg, expand=True, resample=Image.Resampling.BICUBIC)
+            out = BytesIO()
+            rot.save(out, format="JPEG", quality=92)
+            return out.getvalue()
+    except Exception:
+        return b""
+
+
 def _serial_score(result, serial_profile="apple"):
     profile = normalize_serial_profile(serial_profile)
     text = (result or {}).get("text", "") or ""
@@ -93,6 +107,36 @@ def _serial_score(result, serial_profile="apple"):
     valid = bool(serial and is_valid_serial_candidate_for_profile(serial, profile=profile))
     score = (100000 if valid else 0) + int(confidence * 1000) + min(len(text), 120)
     return score, serial
+
+
+def infer_best_rotation_deg(img_data, serial_profile="apple"):
+    """
+    Infer best display rotation (0/90/180/270) for a single captured crop.
+    This runs a lightweight OCR sweep and is intended for accepted scans only.
+    """
+    profile = normalize_serial_profile(serial_profile)
+    try:
+        img_bytes = _decode_input_bytes(img_data)
+    except Exception:
+        return 0
+    try:
+        rotations = [(0, img_bytes)]
+        for deg in (180, 90, 270):
+            rb = _build_rotated_variant(img_bytes, deg)
+            if rb:
+                rotations.append((deg, rb))
+        best_deg = 0
+        best_score = -1
+        for deg, rb in rotations:
+            result = _run_vision_ocr(rb)
+            score, _serial = _serial_score(result, profile)
+            if score > best_score:
+                best_score = score
+                best_deg = deg
+        return int(best_deg) % 360
+    except Exception:
+        return 0
+
 
 def recognize_text_from_binary(img_data, serial_profile="apple"):
     """
@@ -113,6 +157,7 @@ def recognize_text_from_binary(img_data, serial_profile="apple"):
         best = dict(primary)
         best["serial_hint"] = primary_serial
         best["variant"] = "primary"
+        best["rotation_deg"] = 0
 
         # Fallback pass only when first pass is weak or has no serial candidate.
         needs_fallback = (
@@ -124,13 +169,18 @@ def recognize_text_from_binary(img_data, serial_profile="apple"):
             variants = []
             enhanced_bytes = _build_enhanced_variant(img_bytes)
             if enhanced_bytes:
-                variants.append(("enhanced", enhanced_bytes))
+                variants.append(("enhanced", enhanced_bytes, 0))
             threshold_bytes = _build_threshold_variant(img_bytes)
             if threshold_bytes:
-                variants.append(("threshold", threshold_bytes))
+                variants.append(("threshold", threshold_bytes, 0))
+            # Orientation fallback for upside-down/sideways labels from phone capture.
+            for deg in (180, 90, 270):
+                rot_bytes = _build_rotated_variant(img_bytes, deg)
+                if rot_bytes:
+                    variants.append((f"rot{deg}", rot_bytes, deg))
 
             top_score = primary_score
-            for variant_name, variant_bytes in variants:
+            for variant_name, variant_bytes, rotation_deg in variants:
                 result = _run_vision_ocr(variant_bytes)
                 score, serial = _serial_score(result, profile)
                 if score > top_score:
@@ -138,6 +188,7 @@ def recognize_text_from_binary(img_data, serial_profile="apple"):
                     best = dict(result)
                     best["serial_hint"] = serial
                     best["variant"] = variant_name
+                    best["rotation_deg"] = int(rotation_deg)
 
         return best
     except Exception as e:

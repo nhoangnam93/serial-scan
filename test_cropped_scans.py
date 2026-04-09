@@ -4,9 +4,9 @@ import os
 import sys
 from typing import Dict, List, Tuple
 
-from serial_parser import normalize_serial_candidate
+from serial_parser import normalize_serial_candidate, normalize_serial_profile
 from src.vision import recognize_text_from_binary
-from serial_parser import extract_serial_from_text, is_valid_serial_candidate
+from serial_parser import extract_serial_from_text, is_valid_serial_candidate_for_profile
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -36,6 +36,13 @@ def expected_from_filename(filename: str) -> str:
     return normalize_serial_candidate(base)
 
 
+def infer_profile_from_serial(serial: str) -> str:
+    s = normalize_serial_candidate(serial, "dell")
+    if len(s) == 7:
+        return "dell"
+    return "apple"
+
+
 def run() -> int:
     if not os.path.isdir(CROPS_DIR):
         print(f"[ERROR] Missing crops dir: {CROPS_DIR}")
@@ -57,14 +64,15 @@ def run() -> int:
     for fn in files:
         total += 1
         expected = manifest_expected.get(fn) or expected_from_filename(fn)
+        profile = normalize_serial_profile(infer_profile_from_serial(expected))
         path = os.path.join(CROPS_DIR, fn)
         with open(path, "rb") as f:
             raw = f.read()
-        ocr = recognize_text_from_binary(raw)
+        ocr = recognize_text_from_binary(raw, serial_profile=profile)
         text = ocr.get("text", "") or ""
         conf = float(ocr.get("confidence", 0.0) or 0.0)
-        extracted = extract_serial_from_text(text)
-        valid = bool(extracted and is_valid_serial_candidate(extracted))
+        extracted = extract_serial_from_text(text, profile=profile)
+        valid = bool(extracted and is_valid_serial_candidate_for_profile(extracted, profile=profile))
         ok = bool(extracted and extracted == expected and valid)
         if ok:
             passed += 1

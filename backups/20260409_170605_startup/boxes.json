@@ -1,0 +1,107 @@
+{
+  "1775462814415": {
+    "id": "1775462814415",
+    "name": "A",
+    "serial_profile": "apple",
+    "target": [],
+    "scanned": [
+      "C02H80P8Q05P",
+      "C02GP0RXQ05P",
+      "HY0Z8Y3",
+      "C02GP0TPQ05P",
+      "C02GP0TP005P",
+      "9003FH4"
+    ],
+    "user": "Max",
+    "last_active": "2026-04-09 17:00:17",
+    "closed": false,
+    "audit": [
+      {
+        "serial": "C02H80P8Q05P",
+        "serial_profile": "apple",
+        "user": "Max",
+        "method": "camera",
+        "lane": "General",
+        "timestamp": "2026-04-06 15:38:09",
+        "in_target": false,
+        "duplicate_in_box": false,
+        "sid": "LZuBILd77GuyRCxsAAAT",
+        "ip": "10.242.24.98"
+      },
+      {
+        "serial": "C02GP0RXQ05P",
+        "serial_profile": "apple",
+        "user": "Max",
+        "method": "camera",
+        "lane": "General",
+        "timestamp": "2026-04-06 16:41:13",
+        "in_target": false,
+        "duplicate_in_box": false,
+        "sid": "Njl1fcFa00OW8ErVAAAN",
+        "ip": "10.242.24.98"
+      },
+      {
+        "serial": "C02GP0RXQ05P",
+        "serial_profile": "apple",
+        "user": "Max",
+        "method": "camera",
+        "lane": "General",
+        "timestamp": "2026-04-06 16:53:20",
+        "in_target": false,
+        "duplicate_in_box": true,
+        "sid": "XzcUyZsdtrMAqiu6AAAT",
+        "ip": "10.242.24.98"
+      },
+      {
+        "serial": "HY0Z8Y3",
+        "serial_profile": "dell",
+        "user": "Max",
+        "method": "camera",
+        "lane": "A",
+        "timestamp": "2026-04-08 17:30:22",
+        "in_target": false,
+        "duplicate_in_box": false,
+        "sid": "mPQvXGXwykIpp6BjAAAP",
+        "ip": "10.242.26.141"
+      },
+      {
+        "serial": "C02GP0TPQ05P",
+        "serial_profile": "apple",
+        "user": "Max",
+        "method": "camera",
+        "lane": "A",
+        "timestamp": "2026-04-08 17:59:25",
+        "in_target": false,
+        "duplicate_in_box": false,
+        "sid": "8jdHqlo0ULEm4QyyAAA1",
+        "ip": "10.242.26.141"
+      },
+      {
+        "serial": "C02GP0TP005P",
+        "serial_profile": "apple",
+        "user": "Nam",
+        "method": "camera",
+        "lane": "A",
+        "timestamp": "2026-04-08 18:01:06",
+        "in_target": false,
+        "duplicate_in_box": false,
+        "sid": "5nF92mzI4Gi3NHEhAAA9",
+        "ip": "10.242.26.141"
+      },
+      {
+        "serial": "9003FH4",
+        "serial_profile": "dell",
+        "user": "Max",
+        "method": "camera",
+        "lane": "A",
+        "timestamp": "2026-04-09 17:00:17",
+        "in_target": false,
+        "duplicate_in_box": false,
+        "sid": "j5FsruSsWtMSplkFAAAU",
+        "ip": "10.242.26.99",
+        "crop_file": "9003FH4__20260409_170017_000.jpg",
+        "crop_latest_file": "9003FH4.jpg"
+      }
+    ]
+  }
+}

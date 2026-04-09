@@ -5,17 +5,12 @@ WebSocket-powered barcode scanner with live dashboard.
 Multiple users scan simultaneously; all see results in real time.
 """
 
-import eventlet
-eventlet.monkey_patch()
-from eventlet import tpool
-import eventlet.debug
-eventlet.debug.hub_exceptions(False)
-
 import os
 import csv
 import json
 import sqlite3
 import socket
+import ssl
 import base64
 import hashlib
 import hmac
@@ -23,18 +18,20 @@ import logging
 import platform
 import re
 import secrets
+import shutil
 import sys
 import threading
 import time
 import webbrowser
 import io
 import tempfile
+import uuid
 from collections import deque
 from datetime import datetime
 from io import StringIO, BytesIO
 from flask import Flask, request, jsonify, send_file, Response
 from flask_socketio import SocketIO, emit, join_room, leave_room, disconnect
-from src.vision import recognize_text_from_binary
+from src.vision import recognize_text_from_binary, infer_best_rotation_deg
 from serial_parser import (
     extract_serial_from_text,
     is_likely_dell_service_tag,
@@ -90,6 +87,73 @@ def allow_serial(serial, serial_profile="apple"):
     if not STRICT_MACBOOK_ONLY:
         return True
     return is_likely_macbook_serial(normalized) and is_valid_serial_candidate_for_profile(normalized, "apple")
+
+
+def has_strong_serial_context(text, serial, serial_profile="apple"):
+    profile = normalize_serial_profile(serial_profile)
+    if not text or not serial:
+        return False
+    up = str(text).upper()
+    compact = re.sub(r"[^A-Z0-9]", "", up)
+    target = re.sub(r"[^A-Z0-9]", "", str(serial).upper())
+    if not target or target not in compact:
+        return False
+    if profile == "dell":
+        return bool(re.search(r"(?:SERVICE\s*TAG|SVC\s*TAG|SVCTAG|ST\s*[:#-])\s*[A-Z0-9]{5,12}", up))
+    return bool(re.search(r"(?:SERIAL\s*NO\.?|SERIAL|SERIA|S/N|SN)\s*[:#-]?\s*[A-Z0-9\s]{6,24}", up))
+
+
+def has_label_marker(text, serial_profile="apple"):
+    profile = normalize_serial_profile(serial_profile)
+    up = str(text or "").upper()
+    if not up.strip():
+        return False
+    if profile == "dell":
+        return bool(re.search(r"(?:SERVICE\s*TAG|SVC\s*TAG|SVCTAG|ST\s*[:#-])", up))
+    return bool(re.search(r"(?:SERIAL\s*NO\.?|SERIAL|SERIA|S/N|SN)\s*[:#-]?", up))
+
+
+def has_dell_marker_match(text, serial):
+    up = str(text or "").upper()
+    if not up or not serial:
+        return False
+    target = normalize_serial_candidate(serial, "dell")
+    if len(target) != 7:
+        return False
+    patterns = [
+        r"(?:SERVICE\s*TAG|SVC\s*TAG|SVCTAG|ST)\s*[:#-]\s*([A-Z0-9]{6,12})",
+        r"(?:SERVICE\s*TAG|SVC\s*TAG|SVCTAG)\s+([A-Z0-9]{6,12})",
+    ]
+    for pat in patterns:
+        for m in re.finditer(pat, up, re.IGNORECASE):
+            cand = normalize_serial_candidate(m.group(1), "dell")
+            if len(cand) > 7:
+                cand = cand[:7]
+            if cand == target:
+                return True
+    return False
+
+
+def extract_serial_from_strong_context(text, serial_profile="apple"):
+    profile = normalize_serial_profile(serial_profile)
+    up = str(text or "").upper()
+    if not up:
+        return ""
+    if profile == "dell":
+        m = re.search(r"(?:SERVICE\s*TAG|SVC\s*TAG|SVCTAG|ST)\s*[:#-]\s*([A-Z0-9]{6,12})", up, re.IGNORECASE)
+        if not m:
+            return ""
+        cand = normalize_serial_candidate(m.group(1), "dell")
+        if len(cand) > 7:
+            cand = cand[:7]
+        return cand if allow_serial(cand, "dell") else ""
+
+    m = re.search(r"(?:SERIAL\s*NO\.?|SERIAL|SERIA|S/N|SN)\s*[:#-]?\s*([A-Z0-9\s]{8,20})", up, re.IGNORECASE)
+    if not m:
+        return ""
+    tail = re.sub(r"[^A-Z0-9]", "", m.group(1))
+    cand = normalize_serial_candidate(tail, "apple")
+    return cand if allow_serial(cand, "apple") else ""
 
 
 def get_sid_serial_profile(sid, incoming=None):
@@ -263,7 +327,15 @@ def emit_ocr_policy(sid, status="ready", next_delay_ms=None, accepted=None, sour
     socketio.emit("ocr_policy", payload, to=sid)
 
 
-def emit_ocr_success(sid, serial, source=None, next_delay_ms=None, ocr_confidence=None, serial_profile=None):
+def emit_ocr_success(
+    sid,
+    serial,
+    source=None,
+    next_delay_ms=None,
+    ocr_confidence=None,
+    serial_profile=None,
+    ocr_rotation=None,
+):
     state = client_ocr_state.get(sid)
     if next_delay_ms is None:
         next_delay_ms = get_client_ocr_interval_ms(state)
@@ -280,6 +352,11 @@ def emit_ocr_success(sid, serial, source=None, next_delay_ms=None, ocr_confidenc
         payload["source"] = source
     if ocr_confidence is not None:
         payload["ocr_confidence"] = round(float(ocr_confidence), 4)
+    if ocr_rotation is not None:
+        try:
+            payload["ocr_rotation"] = int(ocr_rotation) % 360
+        except Exception:
+            payload["ocr_rotation"] = 0
     profile = normalize_serial_profile(serial_profile or ((state or {}).get("serial_profile")) or DEFAULT_SERIAL_PROFILE)
     payload["serial_profile"] = profile
     socketio.emit("ocr_success", payload, to=sid)
@@ -321,7 +398,7 @@ def process_single_image_for_sid(sid, img_data, source="live_photo", serial_prof
         return
 
     try:
-        ocr_result = tpool.execute(recognize_text_from_binary, img_data, serial_profile)
+        ocr_result = recognize_text_from_binary(img_data, serial_profile)
     except Exception as e:
         print(f"-> OCR Photo Crash for {sid}:", e)
         ocr_metrics["errors"] += 1
@@ -338,11 +415,75 @@ def process_single_image_for_sid(sid, img_data, source="live_photo", serial_prof
     text = (ocr_result or {}).get("text", "") if isinstance(ocr_result, dict) else (ocr_result or "")
     confidence = float((ocr_result or {}).get("confidence", 0.0)) if isinstance(ocr_result, dict) else 0.0
     serial_hint = normalize_serial_candidate((ocr_result or {}).get("serial_hint", ""), serial_profile) if isinstance(ocr_result, dict) else ""
+    ocr_rotation = int((ocr_result or {}).get("rotation_deg", 0) or 0) if isinstance(ocr_result, dict) else 0
     if confidence > 0:
         ocr_metrics["confidence_samples"].append(confidence)
 
     if text and text.strip():
         print(f"-> OCR Photo Text from {sid}: '{text.strip()}'")
+    parsed_serial = extract_serial_from_text(text or "", serial_profile)
+    context_serial = extract_serial_from_strong_context(text or "", serial_profile)
+    hint_serial = serial_hint if allow_serial(serial_hint, serial_profile) else ""
+    parsed_valid = parsed_serial if allow_serial(parsed_serial, serial_profile) else ""
+    context_valid = context_serial if allow_serial(context_serial, serial_profile) else ""
+    if serial_profile == "apple":
+        possible_serial = parsed_valid or hint_serial or context_valid
+    else:
+        possible_serial = hint_serial or parsed_valid or context_valid
+    has_marker = has_label_marker(text or "", serial_profile)
+    dell_marker_match = has_dell_marker_match(text or "", possible_serial) if serial_profile == "dell" else False
+    context_strong = has_strong_serial_context(text or "", possible_serial, serial_profile)
+    required_conf = OCR_ACCEPT_CONTEXT_MIN_CONFIDENCE if context_strong else OCR_ACCEPT_VALID_MIN_CONFIDENCE
+    if serial_profile == "dell":
+        required_conf = max(required_conf, 0.62 if dell_marker_match else 0.86)
+    # Label-only gate for photo flow: require marker, unless OCR is very strong on direct serial.
+    if not has_marker and not (
+        possible_serial
+        and allow_serial(possible_serial, serial_profile)
+        and confidence >= max(0.9, OCR_ACCEPT_VALID_MIN_CONFIDENCE)
+    ):
+        ocr_metrics["no_match"] += 1
+        emit_ocr_policy(
+            sid,
+            status="no_match",
+            next_delay_ms=get_client_ocr_interval_ms(state, 120),
+            accepted=True,
+            source=source,
+            ocr_confidence=confidence,
+        )
+        broadcast_ocr_dashboard()
+        return
+    if (
+        possible_serial
+        and allow_serial(possible_serial, serial_profile)
+        and confidence >= required_conf
+    ):
+        if confidence < OCR_POPUP_MIN_CONFIDENCE:
+            emit_ocr_policy(
+                sid,
+                status="low_confidence",
+                next_delay_ms=get_client_ocr_interval_ms(state, 220),
+                accepted=False,
+                source=source,
+                ocr_confidence=confidence,
+            )
+            broadcast_ocr_dashboard()
+            return
+        preview_rotation = int(ocr_rotation or 0) % 360
+        if preview_rotation == 0:
+            preview_rotation = infer_best_rotation_deg(img_data, serial_profile)
+        ocr_metrics["matches"] += 1
+        emit_ocr_success(
+            sid,
+            possible_serial,
+            source=source,
+            ocr_confidence=confidence,
+            serial_profile=serial_profile,
+            ocr_rotation=preview_rotation,
+        )
+        broadcast_ocr_dashboard()
+        return
+
     if text and confidence <= OCR_MIN_CONFIDENCE:
         emit_ocr_policy(
             sid,
@@ -352,13 +493,6 @@ def process_single_image_for_sid(sid, img_data, source="live_photo", serial_prof
             source=source,
             ocr_confidence=confidence,
         )
-        broadcast_ocr_dashboard()
-        return
-
-    possible_serial = serial_hint or extract_serial_from_text(text or "", serial_profile)
-    if possible_serial and allow_serial(possible_serial, serial_profile):
-        ocr_metrics["matches"] += 1
-        emit_ocr_success(sid, possible_serial, source=source, ocr_confidence=confidence, serial_profile=serial_profile)
         broadcast_ocr_dashboard()
         return
 
@@ -407,7 +541,7 @@ def load_or_create_secret_key():
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = load_or_create_secret_key()
-socketio = SocketIO(app, async_mode="eventlet")
+socketio = SocketIO(app, async_mode="gevent")
 
 CSV_FILE = os.path.join(BASE_DIR, "serial_numbers.csv")
 LANE_CSV_DIR = os.path.join(BASE_DIR, "lane_csv")
@@ -421,10 +555,18 @@ OCR_BASE_INTERVAL_MS = 450
 OCR_MAX_INTERVAL_MS = 1800
 OCR_PRIORITY_WINDOW_SEC = 8
 OCR_PRIORITY_BONUS_MS = 220
-OCR_MIN_CONFIDENCE = float(os.environ.get("OCR_MIN_CONFIDENCE", "0.99"))
+OCR_MIN_CONFIDENCE = float(os.environ.get("OCR_MIN_CONFIDENCE", "0.92"))
+OCR_ACCEPT_VALID_MIN_CONFIDENCE = float(os.environ.get("OCR_ACCEPT_VALID_MIN_CONFIDENCE", "0.82"))
+OCR_ACCEPT_CONTEXT_MIN_CONFIDENCE = float(os.environ.get("OCR_ACCEPT_CONTEXT_MIN_CONFIDENCE", "0.50"))
+OCR_POPUP_MIN_CONFIDENCE = float(os.environ.get("OCR_POPUP_MIN_CONFIDENCE", "1.0"))
+OCR_MATCH_CONFIRM_STREAK = max(1, int(os.environ.get("OCR_MATCH_CONFIRM_STREAK", "2")))
+OCR_MATCH_CONFIRM_STREAK_DELL = max(1, int(os.environ.get("OCR_MATCH_CONFIRM_STREAK_DELL", "1")))
+OCR_MATCH_CONFIRM_WINDOW_SEC = float(os.environ.get("OCR_MATCH_CONFIRM_WINDOW_SEC", "2.0"))
 STRICT_MACBOOK_ONLY = os.environ.get("STRICT_MACBOOK_ONLY", "1").lower() in {"1", "true", "yes", "on"}
 DEFAULT_SERIAL_PROFILE = normalize_serial_profile(os.environ.get("DEFAULT_SERIAL_PROFILE", "apple"))
-JOIN_PIN = os.environ.get("JOIN_PIN", "2026")
+_ENV_JOIN_PIN = str(os.environ.get("JOIN_PIN", "")).strip()
+JOIN_PIN = _ENV_JOIN_PIN if _ENV_JOIN_PIN else "2026"
+JOIN_PIN_DEFAULTED = not bool(_ENV_JOIN_PIN)
 JOIN_PIN_HASH = os.environ.get("JOIN_PIN_HASH", "").strip()
 USERS_FILE = os.path.join(BASE_DIR, "users.json")
 DB_FILE = os.path.join(BASE_DIR, "scanner.db")
@@ -474,10 +616,18 @@ check_serials_cache_by_profile = {"apple": set(), "dell": set()}
 check_serials_mtime = None
 SESSION_STALE_SECONDS = 90
 BOXES_FILE = os.path.join(BASE_DIR, "boxes.json")
+BCK_DIR = os.path.join(BASE_DIR, "backups")
+BCK_MIN_INTERVAL_SEC = int(os.environ.get("BACKUP_MIN_INTERVAL_SEC", "900") or 900)
+BCK_RETENTION = int(os.environ.get("BACKUP_RETENTION", "24") or 24)
+SCAN_IDEMPOTENCY_TTL_SEC = float(os.environ.get("SCAN_IDEMPOTENCY_TTL_SEC", "25") or 25)
 box_registry = {}  # box_id -> {name, target: [], scanned: [], user, last_active}
 box_live_presence = {}  # box_id -> {sid -> member}
 sid_box_membership = {}  # sid -> box_id
 data_lock = threading.Lock()
+backup_lock = threading.Lock()
+idempotency_lock = threading.Lock()
+recent_scan_idempotency = {}  # key -> expire_ts
+last_backup_at = 0.0
 
 
 def db_connect():
@@ -499,12 +649,18 @@ def init_database():
                     client_id TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
                     pin_hash TEXT NOT NULL,
+                    session_version INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     last_login_at TEXT
                 )
                 """
             )
+            # Backward-compatible migration for older DBs.
+            cols = conn.execute("PRAGMA table_info(users)").fetchall()
+            col_names = {str(row["name"]) for row in cols}
+            if "session_version" not in col_names:
+                conn.execute("ALTER TABLE users ADD COLUMN session_version INTEGER NOT NULL DEFAULT 0")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS user_settings (
@@ -574,23 +730,47 @@ def sanitize_user_settings(raw):
 
 def db_list_users():
     with db_connect() as conn:
-        rows = conn.execute(
-            "SELECT client_id, name, pin_hash FROM users ORDER BY updated_at DESC"
-        ).fetchall()
-    return [{"client_id": r["client_id"], "name": r["name"], "pin_hash": r["pin_hash"]} for r in rows]
+        try:
+            rows = conn.execute(
+                "SELECT client_id, name, pin_hash, session_version FROM users ORDER BY updated_at DESC"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            rows = conn.execute(
+                "SELECT client_id, name, pin_hash FROM users ORDER BY updated_at DESC"
+            ).fetchall()
+    return [
+        {
+            "client_id": r["client_id"],
+            "name": r["name"],
+            "pin_hash": r["pin_hash"],
+            "session_version": int((r["session_version"] if "session_version" in r.keys() else 0) or 0),
+        }
+        for r in rows
+    ]
 
 
 def db_get_user(client_id):
     if not client_id:
         return None
     with db_connect() as conn:
-        row = conn.execute(
-            "SELECT client_id, name, pin_hash FROM users WHERE client_id = ?",
-            (str(client_id),),
-        ).fetchone()
+        try:
+            row = conn.execute(
+                "SELECT client_id, name, pin_hash, session_version FROM users WHERE client_id = ?",
+                (str(client_id),),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            row = conn.execute(
+                "SELECT client_id, name, pin_hash FROM users WHERE client_id = ?",
+                (str(client_id),),
+            ).fetchone()
     if not row:
         return None
-    return {"client_id": row["client_id"], "name": row["name"], "pin_hash": row["pin_hash"]}
+    return {
+        "client_id": row["client_id"],
+        "name": row["name"],
+        "pin_hash": row["pin_hash"],
+        "session_version": int((row["session_version"] if "session_version" in row.keys() else 0) or 0),
+    }
 
 
 def db_upsert_user(client_id, name, pin_hash):
@@ -631,9 +811,29 @@ def db_update_user_pin(client_id, pin_hash):
     with data_lock:
         with db_connect() as conn:
             conn.execute(
-                "UPDATE users SET pin_hash = ?, updated_at = ? WHERE client_id = ?",
+                "UPDATE users SET pin_hash = ?, session_version = session_version + 1, updated_at = ? WHERE client_id = ?",
                 (pin_hash, now, str(client_id or "")),
             )
+            conn.commit()
+
+
+def db_bump_session_version(client_id):
+    cid = str(client_id or "").strip()
+    if not cid:
+        return
+    with data_lock:
+        with db_connect() as conn:
+            try:
+                conn.execute(
+                    "UPDATE users SET session_version = session_version + 1, updated_at = ? WHERE client_id = ?",
+                    (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), cid),
+                )
+            except sqlite3.OperationalError:
+                # Legacy DB without session_version; migration in init_database() will add it.
+                conn.execute(
+                    "UPDATE users SET updated_at = ? WHERE client_id = ?",
+                    (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), cid),
+                )
             conn.commit()
 
 
@@ -807,6 +1007,91 @@ def secure_chmod(path, mode=DATA_FILE_MODE):
         pass
 
 
+def _backup_file_list():
+    base_files = [
+        CSV_FILE,
+        CHECK_FILE,
+        USERS_FILE,
+        BOXES_FILE,
+        CROPS_MANIFEST_FILE,
+        DB_FILE,
+        DB_FILE + "-wal",
+        DB_FILE + "-shm",
+    ]
+    return [p for p in base_files if os.path.isfile(p)]
+
+
+def run_backup(reason="periodic", force=False):
+    global last_backup_at
+    now = time.time()
+    if not force and (now - last_backup_at) < max(60, BCK_MIN_INTERVAL_SEC):
+        return None
+    with backup_lock:
+        now = time.time()
+        if not force and (now - last_backup_at) < max(60, BCK_MIN_INTERVAL_SEC):
+            return None
+        os.makedirs(BCK_DIR, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        slug = re.sub(r"[^a-z0-9_-]+", "_", str(reason).lower())[:24]
+        folder = os.path.join(BCK_DIR, f"{stamp}_{slug or 'backup'}")
+        os.makedirs(folder, exist_ok=True)
+        copied = []
+        for src in _backup_file_list():
+            try:
+                dst = os.path.join(folder, os.path.basename(src))
+                shutil.copy2(src, dst)
+                secure_chmod(dst)
+                copied.append(os.path.basename(src))
+            except Exception:
+                continue
+        meta_path = os.path.join(folder, "_meta.json")
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "reason": str(reason),
+                    "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "files": copied,
+                },
+                f,
+                ensure_ascii=True,
+                separators=(",", ":"),
+            )
+        secure_chmod(meta_path)
+        try:
+            dirs = [
+                os.path.join(BCK_DIR, name)
+                for name in os.listdir(BCK_DIR)
+                if os.path.isdir(os.path.join(BCK_DIR, name))
+            ]
+            dirs.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+            for stale in dirs[max(1, BCK_RETENTION):]:
+                shutil.rmtree(stale, ignore_errors=True)
+        except Exception:
+            pass
+        last_backup_at = now
+        return folder
+
+
+def _prune_idempotency_cache(now_ts=None):
+    now_ts = now_ts or time.time()
+    stale = [k for k, exp in recent_scan_idempotency.items() if exp <= now_ts]
+    for k in stale:
+        recent_scan_idempotency.pop(k, None)
+
+
+def claim_scan_idempotency_key(key):
+    token = str(key or "").strip()
+    if not token:
+        return True
+    now_ts = time.time()
+    with idempotency_lock:
+        _prune_idempotency_cache(now_ts)
+        if token in recent_scan_idempotency:
+            return False
+        recent_scan_idempotency[token] = now_ts + max(5.0, SCAN_IDEMPOTENCY_TTL_SEC)
+    return True
+
+
 def atomic_write_json(path, payload):
     directory = os.path.dirname(path) or "."
     os.makedirs(directory, exist_ok=True)
@@ -856,9 +1141,12 @@ def issue_session_token(client_id):
     cid = str(client_id or "").strip()
     if not cid:
         return ""
+    user = db_get_user(cid)
+    session_version = int((user or {}).get("session_version", 0) or 0)
     now = int(time.time())
     payload = {
         "cid": cid,
+        "ver": session_version,
         "iat": now,
         "exp": now + max(300, SESSION_TOKEN_TTL_SECONDS),
     }
@@ -886,10 +1174,34 @@ def verify_session_token(token):
     cid = str((payload or {}).get("cid") or "").strip()
     if not cid or not re.fullmatch(r"[A-Za-z0-9._:-]{1,64}", cid):
         return None
+    expected_version = int((db_get_user(cid) or {}).get("session_version", 0) or 0)
+    token_version = int((payload or {}).get("ver", 0) or 0)
+    if token_version != expected_version:
+        return None
     exp = int((payload or {}).get("exp") or 0)
     if exp <= int(time.time()):
         return None
     return cid
+
+
+def extract_http_session_token():
+    authz = str(request.headers.get("Authorization") or "").strip()
+    if authz.lower().startswith("bearer "):
+        return authz[7:].strip()
+    header = str(request.headers.get("X-Session-Token") or "").strip()
+    if header:
+        return header
+    query = str(request.args.get("st") or "").strip()
+    if query:
+        return query
+    return ""
+
+
+def require_http_session():
+    token = extract_http_session_token()
+    if not token:
+        return None
+    return verify_session_token(token)
 
 
 def hash_pin(pin, salt=None):
@@ -1054,6 +1366,7 @@ def load_user_registry():
             user_registry[row["client_id"]] = {
                 "name": row["name"],
                 "pin_hash": row["pin_hash"],
+                "session_version": int(row.get("session_version", 0) or 0),
             }
             db_ensure_user_settings(row["client_id"])
     except Exception as e:
@@ -1069,8 +1382,34 @@ def save_user_to_registry(client_id, name, pin):
     pin_hash = hash_pin(str(pin or "").strip())
     if not db_upsert_user(cid, name, pin_hash):
         return
-    user_registry[cid] = {"name": name, "pin_hash": pin_hash}
+    user_registry[cid] = {"name": name, "pin_hash": pin_hash, "session_version": 0}
     db_ensure_user_settings(cid)
+
+
+def ensure_session_identity_row(client_id, display_name="Session"):
+    cid = str(client_id or "").strip()
+    if not cid:
+        return None
+    existing = db_get_user(cid)
+    if existing:
+        if cid not in user_registry:
+            user_registry[cid] = {
+                "name": existing.get("name", display_name) or display_name,
+                "pin_hash": existing.get("pin_hash", ""),
+                "session_version": int(existing.get("session_version", 0) or 0),
+            }
+        return existing
+    # Create a non-loginable random hash row so session tokens can be versioned/revoked.
+    random_hash = hash_pin(secrets.token_urlsafe(24))
+    db_upsert_user(cid, (display_name or "Session")[:64], random_hash)
+    created = db_get_user(cid) or {"client_id": cid, "name": display_name, "pin_hash": random_hash, "session_version": 0}
+    user_registry[cid] = {
+        "name": created.get("name", display_name) or display_name,
+        "pin_hash": created.get("pin_hash", random_hash),
+        "session_version": int(created.get("session_version", 0) or 0),
+    }
+    db_ensure_user_settings(cid)
+    return created
 
 
 def find_user_by_pin(pin, exclude_client_id=None):
@@ -1267,7 +1606,7 @@ def require_verified_session(require_user=True):
 
 
 def emit_initial_data_for_sid(sid):
-    if not is_verified_session(sid) or not is_user_authenticated_session(sid):
+    if not is_verified_session(sid):
         return
     rows = read_csv_rows()
     sync_lane_state_from_rows(rows)
@@ -1375,4465 +1714,12 @@ def remove_session(sid):
 # HTML Template
 # ============================================
 
-LEGACY_INDEX_HTML = """
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>NAB Serial Scanner</title>
-<style>
-* { box-sizing:border-box; margin:0; padding:0; }
-:root {
-  --bg:#070b14;
-  --bg2:#0d1424;
-  --bg-card:#10192b;
-  --bg-card-hover:#15213a;
-  --bg-input:#0d1527;
-  --text:#e7edf8;
-  --text2:#a8b4cc;
-  --text3:#6f7f9e;
-  --border:rgba(255,255,255,0.09);
-  --nab-red:#C8102E;
-  --nab-red-dark:#8f0c22;
-  --nab-red-glow:rgba(200,16,46,0.35);
-  --success:#10B981;
-  --success-bg:rgba(16,185,129,0.14);
-  --warning:#F59E0B;
-  --warning-bg:rgba(245,158,11,0.14);
-  --danger:#EF4444;
-  --danger-bg:rgba(239,68,68,0.14);
-  --info:#3B82F6;
-  --info-bg:rgba(59,130,246,0.14);
-  --purple:#8B5CF6;
-  --purple-bg:rgba(139,92,246,0.14);
-  --radius:16px;
-  --radius-sm:10px;
-}
-html, body {
-  min-height:100%;
-  background:
-    radial-gradient(1000px 500px at 10% -10%, rgba(59,130,246,0.12), transparent 60%),
-    radial-gradient(900px 420px at 110% -20%, rgba(200,16,46,0.1), transparent 60%),
-    linear-gradient(180deg, var(--bg2), var(--bg));
-  color:var(--text);
-  font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
-}
-.app { max-width:1280px; margin:0 auto; padding:20px; }
-.header {
-  display:flex; align-items:center; justify-content:space-between; gap:12px;
-  border-bottom:1px solid var(--border); padding-bottom:14px; margin-bottom:14px;
-}
-.logo { display:flex; gap:12px; align-items:center; }
-.logo-icon {
-  width:44px; height:44px; border-radius:12px; display:grid; place-items:center;
-  background:linear-gradient(135deg,var(--nab-red),var(--nab-red-dark)); color:#fff; font-weight:800;
-  box-shadow:0 8px 24px var(--nab-red-glow);
-}
-.logo h1 { font-size:38px; line-height:1.05; font-weight:800; }
-.logo small { color:var(--text2); font-size:13px; }
-.header-right {
-  display:flex;
-  flex-direction:column;
-  align-items:flex-end;
-  gap:6px;
-  min-width:min(68vw, 760px);
-}
-.header-row {
-  display:flex;
-  align-items:center;
-  justify-content:flex-end;
-  gap:8px;
-  flex-wrap:wrap;
-}
-.header-action {
-  flex:0;
-  padding:6px 10px;
-  font-size:11px;
-}
-.user-pill,.conn-pill,.settings-pill,.mode-pill,.auth-pill {
-  display:flex; align-items:center; gap:6px; border:1px solid var(--border);
-  border-radius:999px; padding:7px 12px; font-size:12px; background:rgba(255,255,255,0.04);
-}
-.mode-pill {
-  color:var(--info);
-  background:var(--info-bg);
-  border-color:rgba(56,189,248,0.24);
-}
-.settings-pill {
-  color:var(--text2);
-  background:rgba(59,130,246,0.12);
-  border-color:rgba(59,130,246,0.25);
-}
-.settings-pill.ok {
-  color:var(--success);
-  background:var(--success-bg);
-  border-color:rgba(16,185,129,0.25);
-}
-.settings-pill.warn {
-  color:var(--warning);
-  background:var(--warning-bg);
-  border-color:rgba(245,158,11,0.25);
-}
-.auth-pill {
-  color:var(--warning);
-  background:var(--warning-bg);
-  border-color:rgba(245,158,11,0.25);
-}
-.auth-pill.ok {
-  color:var(--success);
-  background:var(--success-bg);
-  border-color:rgba(16,185,129,0.25);
-}
-.auth-pill.req {
-  color:var(--danger);
-  background:var(--danger-bg);
-  border-color:rgba(239,68,68,0.25);
-}
-.stats { display:grid; grid-template-columns:repeat(5,1fr); gap:10px; margin-bottom:12px; }
-.stat {
-  background:var(--bg-card); border:1px solid var(--border); border-radius:12px; padding:12px;
-}
-.stat-label { color:var(--text3); text-transform:uppercase; font-size:10px; font-weight:700; letter-spacing:0.5px; }
-.stat-val { margin-top:6px; font-size:36px; font-weight:800; line-height:1; }
-.stat.red .stat-val{ color:#fb7185; } .stat.green .stat-val{ color:#34d399; }
-.stat.blue .stat-val{ color:#60a5fa; } .stat.yellow .stat-val{ color:#fbbf24; }
-.stat.purple .stat-val{ color:#a78bfa; }
-.grid { display:grid; grid-template-columns:1.05fr 1fr 1fr; gap:12px; align-items:start; }
-@media (max-width:1100px) { .stats{grid-template-columns:repeat(3,1fr);} .grid{grid-template-columns:1fr;} }
-@media (max-width:760px) {
-  .header { flex-direction:column; align-items:flex-start; gap:10px; }
-  .header-right { width:100%; min-width:0; align-items:stretch; }
-  .header-row { justify-content:flex-start; width:100%; gap:6px; }
-  .header-action { padding:6px 8px; font-size:10px; }
-  .logo h1 { font-size:24px; }
-  .logo small { font-size:11px; }
-  .grid { grid-template-columns:1fr; gap:12px; }
-  .card-body { padding:12px; }
-  .card-head { padding:12px 14px; }
-  /* Bigger scanner on mobile */
-  #reader { min-height: 300px; }
-  /* Bigger touch targets */
-  .btn { padding:14px 16px; font-size:13px; min-height:48px; }
-  .btn-sm { padding:10px 14px; font-size:11px; min-height:40px; }
-  .input-f { padding:14px; font-size:16px; /* 16px prevents iOS zoom */ }
-  .input-f::placeholder { font-size:14px; }
-  .search { padding:12px 12px 12px 36px; font-size:14px; }
-  .modal { padding:24px 20px; }
-  .modal input { font-size:18px; padding:14px; }
-  .modal .btn { padding:16px; font-size:15px; }
-  /* Feed items bigger for touch */
-  .feed-item { padding:12px; gap:10px; }
-  .feed-avatar { width:36px; height:36px; font-size:13px; }
-  .feed-serial { font-size:14px; }
-  .feed-meta { font-size:11px; gap:5px; }
-  .feed-delete { opacity:0.4; padding:8px 12px; font-size:16px; }
-  .feed { max-height:50vh; -webkit-overflow-scrolling:touch; }
-  /* User list */
-  .user-row { padding:10px 12px; }
-  .user-name { font-size:13px; }
-  /* Toasts */
-  .toasts { bottom:12px; right:12px; left:12px; }
-  .toast-msg { font-size:13px; }
-  /* Camera selector */
-  .camera-sel { font-size:12px; padding:8px 10px; max-width:none; flex:1; }
-  .user-pill { font-size:12px; padding:8px 14px; }
-  .conn-pill { font-size:12px; padding:8px 12px; }
-  .settings-pill { font-size:12px; padding:8px 12px; }
-  .mode-pill { font-size:12px; padding:8px 12px; }
-  .auth-pill { font-size:12px; padding:8px 12px; }
-  .settings-pill { display:none; }
-}
-
-/* iOS safe area */
-@supports (padding-bottom: env(safe-area-inset-bottom)) {
-  .app { padding-bottom: calc(40px + env(safe-area-inset-bottom)); }
-}
-
-/* Cards */
-.card {
-  background:var(--bg-card); border:1px solid var(--border);
-  border-radius:var(--radius); overflow:hidden;
-  box-shadow:0 10px 28px rgba(0,0,0,0.22);
-  transition:transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
-}
-.card:hover {
-  transform:translateY(-1px);
-  box-shadow:0 14px 34px rgba(0,0,0,0.28);
-  border-color:rgba(255,255,255,0.12);
-}
-.card-head {
-  display:flex; align-items:center; justify-content:space-between;
-  padding:14px 16px; border-bottom:1px solid var(--border);
-  background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.005));
-}
-.card-title {
-  display:flex; align-items:center; gap:6px;
-  font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:0.6px;
-}
-.card-body { padding:16px; }
-.head-actions {
-  display:flex;
-  align-items:center;
-  gap:6px;
-  flex-wrap:wrap;
-}
-
-/* Scanner */
-.reader-shell { position:relative; width:100%; }
-#reader { width:100%; border-radius:var(--radius-sm); overflow:hidden; background:#000; }
-#reader video { border-radius:var(--radius-sm) !important; object-fit:cover; }
-#reader__dashboard_section { display:none !important; }
-#reader a[href*="scanapp"] { display:none !important; }
-#reader img[alt="Info icon"] { display:none !important; }
-#qr-shaded-region { border-color:rgba(0,0,0,0.55) !important; }
-/* Ensure video fills on iOS */
-#reader video { -webkit-playsinline:true; playsinline:true; }
-.reader-hud {
-  position:absolute;
-  left:8px;
-  right:8px;
-  top:8px;
-  z-index:6;
-  pointer-events:none;
-  display:flex;
-  flex-direction:column;
-  gap:6px;
-}
-.reader-hud-row {
-  display:flex;
-  gap:6px;
-  flex-wrap:wrap;
-}
-.reader-chip {
-  display:inline-flex;
-  align-items:center;
-  gap:4px;
-  max-width:100%;
-  padding:5px 8px;
-  border-radius:8px;
-  border:1px solid rgba(255,255,255,0.2);
-  background:rgba(4,9,20,0.72);
-  backdrop-filter: blur(5px);
-  color:#E6EDF9;
-  font-size:10px;
-  font-weight:700;
-  line-height:1.2;
-  text-shadow:0 1px 0 rgba(0,0,0,0.32);
-}
-.reader-chip.guide {
-  border-color: rgba(125, 211, 252, 0.28);
-  color: #BAE6FD;
-}
-.reader-chip.guide.warn {
-  border-color: rgba(251, 191, 36, 0.35);
-  color: #FDE68A;
-}
-.reader-chip.guide.ok {
-  border-color: rgba(16, 185, 129, 0.35);
-  color: #BBF7D0;
-}
-.reader-hud-proc {
-  display:inline-flex;
-  align-items:center;
-  width:fit-content;
-  max-width:100%;
-  padding:5px 8px;
-  border-radius:8px;
-  border:1px solid rgba(255,255,255,0.18);
-  background:rgba(4,9,20,0.72);
-  backdrop-filter: blur(5px);
-  color:#CBD5E1;
-  font-size:10px;
-  font-weight:600;
-  min-height:20px;
-}
-.reader-hud-proc.active {
-  color:#7DD3FC;
-  border-color:rgba(56,189,248,0.35);
-}
-.reader-controls {
-  position:absolute;
-  left:0;
-  right:0;
-  bottom:10px;
-  z-index:7;
-  display:flex;
-  align-items:center;
-  justify-content:center;
-  gap:10px;
-  pointer-events:none;
-}
-.reader-icon-btn {
-  width:52px;
-  height:52px;
-  border-radius:999px;
-  border:1px solid var(--border);
-  background:rgba(8, 12, 22, 0.86);
-  color:var(--text);
-  font-size:20px;
-  display:inline-flex;
-  align-items:center;
-  justify-content:center;
-  box-shadow:0 10px 24px rgba(0,0,0,0.35);
-  pointer-events:auto;
-}
-.reader-icon-btn:disabled {
-  opacity:0.5;
-}
-.reader-icon-btn.reader-start {
-  color:#fff;
-  background:linear-gradient(180deg, #D62B46, #A0122A);
-  border-color:rgba(255,255,255,0.18);
-}
-.reader-icon-btn.reader-stop {
-  color:#FCA5A5;
-}
-.reader-icon-btn.reader-capture {
-  color:#93C5FD;
-}
-
-.controls { display:flex; gap:6px; margin-top:12px; }
-.func-tabs {
-  display:flex;
-  gap:6px;
-  margin-top:10px;
-}
-.func-tab {
-  flex:1;
-  padding:8px 10px;
-  border-radius:8px;
-  border:1px solid var(--border);
-  background:rgba(255,255,255,0.04);
-  color:var(--text2);
-  font-size:11px;
-  font-weight:700;
-  cursor:pointer;
-}
-.func-tab.active {
-  color:#fff;
-  background:linear-gradient(135deg,var(--nab-red),var(--nab-red-dark));
-  border-color:transparent;
-}
-.serial-profile-switch {
-  margin-top:8px;
-  display:flex;
-  gap:6px;
-}
-.serial-profile-btn {
-  flex:1;
-  padding:8px 10px;
-  border-radius:8px;
-  border:1px solid var(--border);
-  background:rgba(255,255,255,0.03);
-  color:var(--text2);
-  font-size:11px;
-  font-weight:700;
-  cursor:pointer;
-}
-.serial-profile-btn.active {
-  color:#fff;
-  border-color:rgba(16,185,129,0.35);
-  background:rgba(16,185,129,0.18);
-}
-.btn {
-  flex:1; padding:10px 12px; border-radius:var(--radius-sm); border:none;
-  font-family:'Inter',sans-serif; font-size:11px; font-weight:700;
-  cursor:pointer; transition:all 0.25s; text-transform:uppercase;
-  display:flex; align-items:center; justify-content:center; gap:5px;
-}
-.btn-red { background:linear-gradient(135deg,var(--nab-red),var(--nab-red-dark)); color:#fff; box-shadow:0 4px 16px var(--nab-red-glow); }
-.btn-red:hover { transform:translateY(-1px); box-shadow:0 6px 24px var(--nab-red-glow); }
-.btn-ghost { background:rgba(255,255,255,0.05); color:var(--text); border:1px solid var(--border); }
-.btn-ghost:hover { background:rgba(255,255,255,0.08); }
-.btn-green { background:var(--success-bg); color:var(--success); border:1px solid rgba(16,185,129,0.2); }
-.btn-danger { background:var(--danger-bg); color:var(--danger); border:1px solid rgba(239,68,68,0.2); }
-.btn-sm { flex:0; padding:7px 12px; font-size:10px; }
-.btn:disabled { opacity:0.35; cursor:not-allowed; transform:none !important; animation:none !important; box-shadow:none !important; }
-
-@keyframes pulseBtn {
-  0% { box-shadow: 0 0 0 0 rgba(200,16,46,0.6); }
-  70% { box-shadow: 0 0 0 12px rgba(200,16,46,0); }
-  100% { box-shadow: 0 0 0 0 rgba(200,16,46,0); }
-}
-.btn-pulse { animation: pulseBtn 2s infinite; }
-
-.input-row { display:flex; gap:6px; margin-top:10px; }
-.tune-advanced {
-  margin-top:8px;
-  border:1px solid var(--border);
-  border-radius:10px;
-  padding:8px 10px;
-  background:rgba(255,255,255,0.03);
-}
-.tune-grid {
-  display:grid;
-  grid-template-columns:repeat(2, minmax(0,1fr));
-  gap:8px 10px;
-  margin-top:8px;
-}
-.tune-row {
-  display:flex;
-  flex-direction:column;
-  gap:4px;
-  min-width:0;
-}
-.tune-row label {
-  font-size:10px;
-  color:var(--text2);
-  font-weight:700;
-}
-.tune-row input[type=\"range\"] {
-  width:100%;
-}
-.tune-val {
-  font-size:10px;
-  color:var(--text3);
-  font-family:'JetBrains Mono',monospace;
-}
-.input-f {
-  flex:1; padding:10px 12px; border-radius:var(--radius-sm);
-  border:1px solid var(--border); background:var(--bg-input);
-  color:var(--text); font-family:'JetBrains Mono',monospace; font-size:13px;
-  outline:none; transition:all 0.2s;
-}
-.input-f:focus { border-color:var(--nab-red); box-shadow:0 0 0 3px rgba(200,16,46,0.12); }
-.input-f::placeholder { color:var(--text3); font-family:'Inter',sans-serif; font-size:12px; }
-
-.banner {
-  margin-top:10px; padding:10px 14px; border-radius:var(--radius-sm);
-  display:none; align-items:center; gap:8px;
-  font-size:12px; font-weight:600;
-  animation: bannerIn 0.35s cubic-bezier(0.34,1.56,0.64,1);
-}
-.banner.show { display:flex; }
-.banner.success { background:var(--success-bg); color:var(--success); }
-.banner.warning { background:var(--warning-bg); color:var(--warning); }
-.banner.info { background:var(--info-bg); color:var(--info); }
-.banner .mono { font-family:'JetBrains Mono',monospace; font-weight:700; letter-spacing:0.5px; }
-@keyframes bannerIn { from { opacity:0; transform:translateY(-4px); } to { opacity:1; transform:translateY(0); } }
-
-/* Live feed */
-.feed { max-height:380px; overflow-y:auto; }
-.feed::-webkit-scrollbar { width:3px; }
-.feed::-webkit-scrollbar-thumb { background:rgba(255,255,255,0.08); border-radius:4px; }
-
-.feed-item {
-  display:flex; align-items:flex-start; gap:10px;
-  padding:10px 12px; border-radius:var(--radius-sm); margin-bottom:4px;
-  border:1px solid transparent; transition:all 0.2s;
-  animation: feedIn 0.3s ease;
-}
-.feed-item:hover { background:var(--bg-card-hover); border-color:var(--border); }
-@keyframes feedIn { from { opacity:0; transform:translateX(-8px); } to { opacity:1; transform:translateX(0); } }
-
-.feed-avatar {
-  width:32px; height:32px; border-radius:8px;
-  display:grid; place-items:center;
-  font-size:12px; font-weight:800; flex-shrink:0;
-  text-transform:uppercase;
-}
-.feed-content { flex:1; min-width:0; }
-.feed-thumb {
-  width:52px;
-  height:34px;
-  object-fit:cover;
-  border-radius:8px;
-  border:1px solid var(--border);
-  background:#000;
-  flex-shrink:0;
-  cursor:zoom-in;
-}
-.feed-serial {
-  font-family:'JetBrains Mono',monospace;
-  font-size:13px; font-weight:700; letter-spacing:0.3px;
-}
-.feed-meta {
-  font-size:10px; color:var(--text3); margin-top:2px;
-  display:flex; gap:6px; align-items:center; flex-wrap:wrap;
-}
-.feed-badge {
-  font-size:9px; font-weight:700; padding:1px 5px;
-  border-radius:3px; text-transform:uppercase; letter-spacing:0.3px;
-}
-.fb-camera { background:var(--info-bg); color:var(--info); }
-.fb-manual { background:rgba(255,255,255,0.05); color:var(--text2); }
-.fb-dupe { background:var(--warning-bg); color:var(--warning); }
-.fb-check { background:var(--success-bg); color:var(--success); }
-
-.feed-delete {
-  opacity:0; border:none; background:none; color:var(--danger);
-  cursor:pointer; padding:4px 8px; font-size:14px; transition:opacity 0.2s;
-  -webkit-tap-highlight-color:transparent;
-}
-.feed-item:hover .feed-delete { opacity:0.5; }
-.feed-delete:hover { opacity:1 !important; }
-/* On touch devices, always show delete btn faintly */
-@media (hover:none) { .feed-delete { opacity:0.35; } }
-
-.feed-empty { text-align:center; padding:40px 16px; color:var(--text3); font-size:12px; }
-.feed-empty .icon { font-size:32px; margin-bottom:8px; opacity:0.2; }
-.feed-count {
-  margin:-2px 0 8px;
-  font-size:11px;
-  color:var(--text2);
-}
-
-/* Online users */
-.users-list { display:flex; flex-direction:column; gap:4px; }
-.user-row {
-  display:flex; align-items:center; gap:8px;
-  padding:8px 10px; border-radius:var(--radius-sm);
-  transition:all 0.2s; animation: feedIn 0.3s ease;
-}
-.user-row:hover { background:var(--bg-card-hover); }
-.user-dot { width:7px; height:7px; border-radius:50%; background:var(--success); animation: blink 2s infinite; flex-shrink:0; }
-@keyframes blink { 0%,100% { opacity:1; } 50% { opacity:0.3; } }
-.user-name { font-size:12px; font-weight:600; display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
-.user-info { font-size:10px; color:var(--text3); }
-.user-you {
-  font-size:9px; font-weight:700; background:var(--purple-bg); color:var(--purple);
-  padding:1px 5px; border-radius:3px; margin-left:4px;
-}
-.user-badge {
-  font-size:9px; font-weight:700; padding:1px 5px;
-  border-radius:999px; letter-spacing:0.2px; text-transform:uppercase;
-}
-.ub-scanning { background:var(--success-bg); color:var(--success); }
-.ub-photo { background:var(--info-bg); color:var(--info); }
-.ub-idle { background:rgba(255,255,255,0.05); color:var(--text2); }
-.ub-manual { background:var(--warning-bg); color:var(--warning); }
-
-.mini-stats { display:grid; grid-template-columns:repeat(2,1fr); gap:8px; }
-.mini-stat {
-  border:1px solid var(--border); border-radius:10px; padding:10px 12px;
-  background:rgba(255,255,255,0.02);
-}
-.mini-stat-label {
-  font-size:10px; color:var(--text3); text-transform:uppercase; letter-spacing:0.5px; font-weight:700;
-}
-.mini-stat-value {
-  margin-top:4px; font-family:'JetBrains Mono',monospace; font-size:18px; font-weight:700; color:var(--text);
-}
-.mini-note { margin-top:10px; font-size:11px; color:var(--text2); line-height:1.4; }
-.engine-status {
-  margin-top:10px; display:flex; align-items:center; justify-content:space-between; gap:10px;
-}
-.status-pill {
-  font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:0.5px;
-  padding:4px 8px; border-radius:999px; border:1px solid var(--border);
-}
-.status-idle { background:rgba(255,255,255,0.04); color:var(--text2); }
-.status-active { background:var(--success-bg); color:var(--success); border-color:rgba(16,185,129,0.25); }
-.status-busy { background:var(--warning-bg); color:var(--warning); border-color:rgba(245,158,11,0.25); }
-.meter-wrap { margin-top:8px; display:flex; flex-direction:column; gap:6px; }
-.meter-row { display:flex; align-items:center; justify-content:space-between; gap:10px; font-size:10px; color:var(--text2); }
-.meter-track {
-  width:100%; height:6px; border-radius:999px; background:rgba(255,255,255,0.08); overflow:hidden;
-}
-.meter-fill {
-  height:100%; width:0%; border-radius:999px; transition:width 0.25s ease;
-}
-.meter-pool { background:linear-gradient(90deg, #06B6D4, #3B82F6); }
-.meter-hit { background:linear-gradient(90deg, #10B981, #22C55E); }
-
-/* Search */
-.search {
-  width:100%; padding:9px 12px 9px 32px; border-radius:var(--radius-sm);
-  border:1px solid var(--border); background:var(--bg-input);
-  color:var(--text); font-size:12px; outline:none; transition:all 0.2s;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' fill='%234B5563' viewBox='0 0 16 16'%3E%3Cpath d='M11.742 10.344a6.5 6.5 0 1 0-1.397 1.398h-.001c.03.04.062.078.098.115l3.85 3.85a1 1 0 0 0 1.415-1.414l-3.85-3.85a1.007 1.007 0 0 0-.115-.1zM12 6.5a5.5 5.5 0 1 1-11 0 5.5 5.5 0 0 1 11 0z'/%3E%3C/svg%3E");
-  background-repeat:no-repeat; background-position:10px center;
-  margin-bottom:10px;
-}
-.search:focus { border-color:var(--nab-red); }
-
-/* Flash */
-.scan-flash {
-  position:fixed; inset:0; z-index:9999; pointer-events:none;
-  opacity:0; transition:opacity 0.1s;
-}
-.scan-flash.on { opacity:1; }
-
-/* Toast */
-.toasts { position:fixed; bottom:16px; right:16px; z-index:999; display:flex; flex-direction:column; gap:6px; }
-.toast-msg {
-  background:var(--bg-card); border:1px solid var(--border);
-  color:var(--text); padding:10px 16px; border-radius:var(--radius-sm);
-  font-size:12px; font-weight:500; box-shadow:0 8px 32px rgba(0,0,0,0.4);
-  animation: toastIn 0.3s ease, toastOut 0.3s ease 2.5s forwards;
-}
-@keyframes toastIn { from { opacity:0; transform:translateX(16px); } to { opacity:1; transform:translateX(0); } }
-@keyframes toastOut { to { opacity:0; transform:translateX(16px); } }
-
-/* Name modal */
-.modal-bg {
-  position:fixed; inset:0; z-index:10000;
-  background:rgba(0,0,0,0.7); backdrop-filter:blur(8px);
-  display:grid; place-items:center;
-}
-.modal {
-  background: rgba(17, 22, 33, 0.85);
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
-  border-radius: 24px; padding: 36px; width: 380px; max-width: 92vw;
-  text-align: center; 
-  box-shadow: 
-    0 4px 6px -1px rgba(0, 0, 0, 0.1), 
-    0 2px 4px -1px rgba(0, 0, 0, 0.06),
-    0 20px 40px -10px rgba(0, 0, 0, 0.5);
-  animation: modalScale 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
-}
-@keyframes modalScale {
-  from { opacity: 0; transform: scale(0.9) translateY(10px); }
-  to { opacity: 1; transform: scale(1) translateY(0); }
-}
-.modal h2 { font-size:18px; font-weight:800; margin-bottom:6px; }
-.modal p { font-size:13px; color:var(--text2); margin-bottom:20px; }
-.modal input {
-  width:100%; padding:12px 14px; border-radius:var(--radius-sm);
-  border:1px solid var(--border); background:var(--bg-input);
-  color:var(--text); font-size:15px; font-weight:600;
-  outline:none; text-align:center; margin-bottom:12px;
-}
-.modal input:focus { border-color:var(--nab-red); }
-.modal .btn { width:100%; }
-
-.camera-sel {
-  padding:6px 8px; border-radius:6px; border:1px solid var(--border);
-  background:var(--bg-input); color:var(--text);
-  font-size:10px; outline:none; cursor:pointer; max-width:140px;
-}
-
-.perf-note {
-  margin-top:10px; font-size:11px; color:var(--text2);
-  display:flex; justify-content:space-between; gap:8px; flex-wrap:wrap;
-}
-.proc-note {
-  margin-top:6px;
-  font-size:11px;
-  color:var(--text2);
-  min-height:16px;
-}
-.proc-note.active {
-  color: var(--info);
-}
-.hold-card {
-  position:fixed;
-  left:50%;
-  top:50%;
-  transform:translate(-50%, -50%);
-  width:min(92vw, 420px);
-  padding:12px;
-  border:1px solid var(--border);
-  border-radius:var(--radius-sm);
-  background:var(--bg-card);
-  box-shadow:0 20px 60px rgba(0,0,0,0.55);
-  z-index:10020;
-  display:none;
-}
-.hold-card.show {
-  display:block;
-  animation:bannerIn 0.25s ease;
-}
-.hold-title {
-  font-size:12px;
-  font-weight:700;
-  color:var(--text);
-  margin-bottom:6px;
-}
-.hold-check-icon {
-  display:inline-flex;
-  align-items:center;
-  gap:5px;
-  margin-bottom:8px;
-  font-size:11px;
-  font-weight:700;
-  color:var(--success);
-  background:var(--success-bg);
-  border:1px solid rgba(16,185,129,0.24);
-  border-radius:999px;
-  padding:3px 8px;
-}
-.feed-check-icon {
-  display:inline-flex;
-  align-items:center;
-  justify-content:center;
-  width:16px;
-  height:16px;
-  border-radius:999px;
-  margin-right:6px;
-  color:var(--success);
-  background:var(--success-bg);
-  border:1px solid rgba(16,185,129,0.22);
-  font-size:10px;
-  font-weight:800;
-  vertical-align:middle;
-}
-.hold-serial {
-  font-family:'JetBrains Mono',monospace;
-  font-size:16px;
-  font-weight:700;
-  color:var(--text);
-  letter-spacing:0.4px;
-}
-.hold-meta {
-  margin-top:6px;
-  font-size:11px;
-  color:var(--text2);
-}
-.hold-actions {
-  margin-top:10px;
-  display:flex;
-  gap:8px;
-}
-.hold-overlay {
-  position:fixed;
-  inset:0;
-  background:rgba(0,0,0,0.46);
-  backdrop-filter:blur(3px);
-  z-index:10010;
-  display:none;
-}
-.hold-overlay.show {
-  display:block;
-}
-.queue-box {
-  margin-top:10px;
-  padding:10px;
-  border:1px solid var(--border);
-  border-radius:var(--radius-sm);
-  background:rgba(255,255,255,0.02);
-}
-.queue-box.import-mode {
-  background:rgba(16,185,129,0.05);
-  border-color:rgba(16,185,129,0.2);
-}
-.queue-head {
-  display:flex;
-  align-items:center;
-  justify-content:space-between;
-  gap:8px;
-  font-size:11px;
-  font-weight:700;
-  color:var(--text2);
-  text-transform:uppercase;
-  letter-spacing:0.4px;
-}
-.queue-controls {
-  margin-top:8px;
-  display:flex;
-  gap:6px;
-}
-.queue-link {
-  margin-top:8px;
-  font-size:11px;
-  color:var(--text2);
-  display:flex;
-  align-items:center;
-  gap:6px;
-}
-.queue-select {
-  flex:1;
-  min-width:120px;
-  padding:8px;
-  border-radius:8px;
-  border:1px solid var(--border);
-  background:var(--bg-input);
-  color:var(--text);
-  font-size:11px;
-}
-.queue-input {
-  flex:1;
-  min-width:100px;
-  padding:8px;
-  border-radius:8px;
-  border:1px solid var(--border);
-  background:var(--bg-input);
-  color:var(--text);
-  font-size:11px;
-}
-.queue-current {
-  margin-top:6px;
-  font-family:'JetBrains Mono',monospace;
-  font-size:13px;
-  color:var(--text);
-}
-.queue-list {
-  margin-top:8px;
-  display:flex;
-  flex-direction:column;
-  gap:4px;
-  max-height:88px;
-  overflow:auto;
-}
-.queue-item {
-  font-size:11px;
-  color:var(--text2);
-  display:flex;
-  justify-content:space-between;
-  gap:8px;
-}
-.check-box {
-  margin-top:10px;
-  padding-top:10px;
-  border-top:1px dashed var(--border);
-}
-#checkBox {
-  border:1px solid rgba(16,185,129,0.18);
-  border-radius:10px;
-  padding:10px;
-  background:rgba(16,185,129,0.06);
-}
-.mode-summary {
-  margin-top:10px;
-  border:1px solid var(--border);
-  border-radius:10px;
-  background:rgba(255,255,255,0.03);
-  padding:8px 10px;
-}
-.mode-title {
-  font-size:11px;
-  font-weight:700;
-  color:var(--text);
-  letter-spacing:0.3px;
-}
-.mode-sub {
-  margin-top:4px;
-  font-size:11px;
-  color:var(--text2);
-}
-.import-actions {
-  margin-top:8px;
-  display:flex;
-  gap:6px;
-}
-.import-actions .btn {
-  flex:1;
-}
-.import-note {
-  margin-top:6px;
-  font-size:11px;
-  color:var(--text2);
-}
-.check-title {
-  font-size:11px;
-  font-weight:700;
-  color:var(--text);
-  margin-bottom:6px;
-}
-.check-head {
-  display:flex;
-  align-items:center;
-  justify-content:space-between;
-  gap:6px;
-  font-size:11px;
-  color:var(--text2);
-}
-.check-preview {
-  margin-top:6px;
-  max-height:82px;
-  overflow:auto;
-  font-size:11px;
-  color:var(--text2);
-  font-family:'JetBrains Mono',monospace;
-}
-.check-form {
-  margin-top:8px;
-  display:flex;
-  gap:6px;
-}
-.box-lobby {
-  margin-bottom:10px;
-  display:flex;
-  flex-direction:column;
-  gap:6px;
-  max-height:140px;
-  overflow:auto;
-}
-.box-lobby-item {
-  display:flex;
-  align-items:center;
-  justify-content:space-between;
-  gap:8px;
-  padding:8px 10px;
-  border-radius:10px;
-  border:1px solid var(--border);
-  background:rgba(255,255,255,0.02);
-  cursor:pointer;
-}
-.box-lobby-item.active {
-  border-color:rgba(59,130,246,0.35);
-  background:rgba(59,130,246,0.1);
-}
-.box-lobby-meta {
-  font-size:10px;
-  color:var(--text2);
-}
-.box-collabs {
-  margin-bottom:8px;
-  font-size:11px;
-  color:var(--text2);
-}
-.box-found {
-  margin-bottom:10px;
-  border:1px dashed var(--border);
-  border-radius:8px;
-  padding:6px 8px;
-  font-size:11px;
-  color:var(--text2);
-}
-.box-found.show {
-  color:var(--success);
-  border-color:rgba(16,185,129,0.45);
-  background:rgba(16,185,129,0.12);
-  animation:foundPulse 0.55s ease;
-}
-@keyframes foundPulse {
-  from { transform:scale(0.98); opacity:0.5; }
-  to { transform:scale(1); opacity:1; }
-}
-@media (max-width:760px) {
-  .controls, .input-row, .check-form, .queue-controls, .import-actions, .head-actions, .serial-profile-switch {
-    flex-wrap:wrap;
-  }
-  .controls .btn, .import-actions .btn {
-    min-width:120px;
-  }
-  .check-head {
-    flex-wrap:wrap;
-  }
-  .tune-grid {
-    grid-template-columns:1fr;
-  }
-  .reader-icon-btn {
-    width:56px;
-    height:56px;
-    font-size:22px;
-  }
-}
-</style>
-</head>
-<body>
-
-<div class="scan-flash" id="scanFlash"></div>
-
-<!-- Unified Login Modal -->
-<div class="modal-bg" id="unifiedAuthModal" style="display:none;">
-  <div class="modal">
-    <!-- Step 1: PIN Entry -->
-    <div id="authStep1">
-      <div style="font-size:42px; margin-bottom:16px;">🔐</div>
-      <h2>NAB Scanner</h2>
-      <p>Enter your PIN to sign in</p>
-      <input type="password" id="unifiedPinInput" placeholder="PIN"
-             onkeydown="if(event.key==='Enter') submitUnifiedPin()" autofocus>
-      <div id="authError" style="display:none; margin-bottom:12px; padding:8px 12px; border-radius:8px; background:var(--danger-bg); color:var(--danger); font-size:12px; font-weight:600; animation:bannerIn 0.3s ease;"></div>
-      <button class="btn btn-red" id="authSubmitBtn" onclick="submitUnifiedPin()">Sign In</button>
-    </div>
-    <!-- Step 2: New User Registration (shown after join PIN) -->
-    <div id="authStep2" style="display:none;">
-      <div style="font-size:42px; margin-bottom:16px;">👤</div>
-      <h2>Create Profile</h2>
-      <p>Set your name and a personal PIN to sign in next time</p>
-      <div style="display:flex; flex-direction:column; gap:12px; margin-bottom:20px;">
-        <input type="text" id="nameInput" placeholder="Your name"
-               style="margin-bottom:0;" onkeydown="if(event.key==='Enter') document.getElementById('regPinInput').focus()">
-        <input type="password" id="regPinInput" placeholder="Create personal PIN"
-               style="margin-bottom:0;" onkeydown="if(event.key==='Enter') document.getElementById('regPinConfirmInput').focus()">
-        <input type="password" id="regPinConfirmInput" placeholder="Confirm PIN"
-               style="margin-bottom:0;" onkeydown="if(event.key==='Enter') registerUser()">
-      </div>
-      <div id="regError" style="display:none; margin-bottom:12px; padding:8px 12px; border-radius:8px; background:var(--danger-bg); color:var(--danger); font-size:12px; font-weight:600; animation:bannerIn 0.3s ease;"></div>
-      <button class="btn btn-red" onclick="registerUser()">Create Profile</button>
-      <div style="margin-top:12px;">
-        <a href="#" onclick="showAuthStep1(); return false;" style="color:var(--text3); text-decoration:none; font-size:12px;">← Back to PIN</a>
-      </div>
-    </div>
-  </div>
-</div>
-
-<!-- Legacy modal IDs kept as hidden for JS compatibility -->
-<div id="pinModal" style="display:none;"></div>
-<div id="nameModal" style="display:none;"></div>
-<div id="authChoiceModal" style="display:none;"></div>
-<div id="userPinModal" style="display:none;"></div>
-
-<!-- Profile Modal (Edit User Info) -->
-<div class="modal-bg" id="profileModal" style="display:none;" onclick="if(event.target===this) closeProfile()">
-  <div class="modal">
-    <div style="font-size:42px; margin-bottom:16px;">👤</div>
-    <h2>Edit Profile</h2>
-    <p>Update your scanner identity</p>
-    <div style="display:flex; flex-direction:column; gap:12px; margin-bottom:20px; text-align:left;">
-      <div>
-        <label style="font-size:11px; font-weight:700; color:var(--text3); text-transform:uppercase; margin-left:4px;">Full Name</label>
-        <input type="text" id="profNameInput" placeholder="Name" style="margin-top:4px; margin-bottom:0;">
-      </div>
-      <div>
-        <label style="font-size:11px; font-weight:700; color:var(--text3); text-transform:uppercase; margin-left:4px;">Change PIN (Leave blank to keep)</label>
-        <input type="password" id="profPinInput" placeholder="New PIN" style="margin-top:4px; margin-bottom:0;">
-      </div>
-    </div>
-    <div style="display:flex; gap:10px;">
-      <button class="btn btn-ghost" onclick="closeProfile()">Cancel</button>
-      <button class="btn btn-red" onclick="updateProfile()">Save Changes</button>
-    </div>
-  </div>
-</div>
-
-<!-- Bulk Import Modal -->
-<div class="modal-bg" id="bulkImportModal" style="display:none;" onclick="if(event.target===this) closeBulkImport()">
-  <div class="modal">
-    <div style="font-size:42px; margin-bottom:16px;">📥</div>
-    <h2>Bulk Import serials</h2>
-    <p>Paste a list of serials to add to check.csv (one per line or separated by spaces/commas)</p>
-    <textarea id="bulkImportInput" placeholder="S001, S002, S003..." 
-              style="width:100%; height:160px; border-radius:12px; border:1px solid var(--border); background:var(--bg-input); color:var(--text); padding:12px; font-family:'JetBrains Mono',monospace; font-size:13px; outline:none; margin-bottom:18px;"></textarea>
-    <div style="display:flex; gap:10px;">
-      <button class="btn btn-ghost" onclick="closeBulkImport()">Cancel</button>
-      <button class="btn btn-red" onclick="submitBulkImport()">Import All</button>
-    </div>
-  </div>
-</div>
-
-<div class="app">
-  <header class="header">
-    <div class="logo">
-      <div class="logo-icon">★</div>
-      <div>
-        <h1>NAB Serial Scanner</h1>
-        <small>Multi-User Real-Time &bull; v3.0</small>
-      </div>
-    </div>
-    <div class="header-right">
-      <div class="header-row">
-        <button class="btn btn-ghost btn-sm header-action" onclick="showQr()">📱 QR</button>
-        <select class="camera-sel" id="cameraSel" onchange="switchCamera()">
-          <option>Loading…</option>
-        </select>
-        <div class="conn-pill" id="connPill" style="background:var(--success-bg); color:var(--success);">
-          <span style="width:6px;height:6px;border-radius:50%;background:var(--success);animation:blink 2s infinite;"></span>
-          <span id="connCount">0</span> online
-        </div>
-      </div>
-      <div class="header-row">
-        <div class="auth-pill" id="authPill">Auth required</div>
-        <div class="mode-pill" id="modePill">Inventory • Apple</div>
-        <div class="user-pill" id="userPill" onclick="changeName()">👤 —</div>
-        <div class="settings-pill" id="settingsPill">Prefs local</div>
-        <button class="btn btn-ghost btn-sm header-action" onclick="logoutSession()">Logout</button>
-        <button class="btn btn-ghost btn-sm header-action" onclick="clearAppCache()">Clear Cache</button>
-      </div>
-    </div>
-  </header>
-
-  <!-- Stats -->
-  <div class="stats">
-    <div class="stat red"><div class="stat-label">Total Scans</div><div class="stat-val" id="sTotal">0</div></div>
-    <div class="stat green"><div class="stat-label">Today</div><div class="stat-val" id="sToday">0</div></div>
-    <div class="stat blue"><div class="stat-label">Unique</div><div class="stat-val" id="sUnique">0</div></div>
-    <div class="stat yellow"><div class="stat-label">Duplicates</div><div class="stat-val" id="sDupes">0</div></div>
-    <div class="stat purple"><div class="stat-label">Users Online</div><div class="stat-val" id="sOnline">0</div></div>
-  </div>
-
-  <!-- Grid -->
-  <div class="grid">
-    <!-- Scanner -->
-    <div>
-      <div class="card">
-        <div class="card-head">
-          <div class="card-title">📷 Scanner</div>
-          <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
-            <label style="display:flex;align-items:center;gap:5px;font-size:10px;color:var(--text2);cursor:pointer;">
-              <input type="checkbox" id="autosave" checked onchange="onAutosaveChange()" style="accent-color:var(--nab-red);">
-              Auto-save
-            </label>
-            <label style="display:flex;align-items:center;gap:5px;font-size:10px;color:var(--text2);cursor:pointer;">
-              <input type="checkbox" id="autoScanStart" checked onchange="onAutoScanStartChange()" style="accent-color:var(--nab-red);">
-              Auto-start
-            </label>
-          </div>
-        </div>
-        <div class="card-body">
-          <div class="reader-shell">
-            <div id="reader"></div>
-            <div class="reader-hud">
-              <div class="reader-hud-row">
-                <span id="perfMode" class="reader-chip">Smart OCR session idle</span>
-                <span id="perfLoad" class="reader-chip">M4 OCR pool 0/0</span>
-                <span id="guideChip" class="reader-chip guide">🎯 Align serial label</span>
-              </div>
-              <div class="reader-hud-proc" id="procNote">Ready.</div>
-            </div>
-            <div class="reader-controls">
-              <button class="reader-icon-btn reader-start btn-pulse" id="startBtn" onclick="startScanner()" title="Start scanner" aria-label="Start scanner">▶</button>
-              <button class="reader-icon-btn reader-stop" id="stopBtn" onclick="stopScanner()" title="Stop scanner" aria-label="Stop scanner" disabled>⏹</button>
-              <button class="reader-icon-btn reader-capture" id="photoBtn" onclick="capturePhoto()" title="Capture photo" aria-label="Capture photo" disabled>📸</button>
-            </div>
-          </div>
-          <div class="func-tabs">
-            <button class="func-tab active" id="funcInventoryBtn" onclick="setFunctionMode('inventory')">Check Inventory</button>
-            <button class="func-tab" id="funcBoxBtn" onclick="setFunctionMode('box')">Box Counting</button>
-            <button class="func-tab" id="funcImportBtn" onclick="setFunctionMode('import')">Import check.csv</button>
-          </div>
-          <div class="mode-summary">
-            <div class="mode-title" id="modeTitle">Mode: Check Inventory</div>
-            <div class="mode-sub" id="modeSub">Scan against checklist and save directly into the selected box.</div>
-          </div>
-          <div class="serial-profile-switch">
-            <button class="serial-profile-btn active" id="profileAppleBtn" onclick="setSerialProfile('apple')">Apple Serial</button>
-            <button class="serial-profile-btn" id="profileDellBtn" onclick="setSerialProfile('dell')">Dell Service Tag</button>
-          </div>
-          <div class="input-row" style="margin-top:8px;">
-            <select class="queue-select" id="cameraTuningSel" onchange="onCameraTuningProfileChange()">
-              <option value="auto">Camera Tuning: Auto</option>
-              <option value="iphone">Camera Tuning: iPhone</option>
-              <option value="android">Camera Tuning: Android</option>
-              <option value="desktop">Camera Tuning: Desktop</option>
-              <option value="aggressive">Camera Tuning: Aggressive OCR</option>
-            </select>
-          </div>
-          <details class="tune-advanced">
-            <summary style="font-size:11px;color:var(--text2);cursor:pointer;">Advanced Camera Tuning</summary>
-            <div class="tune-grid">
-              <div class="tune-row">
-                <label for="tuneMinLight">Min Light</label>
-                <input id="tuneMinLight" type="range" min="28" max="72" step="1" oninput="onTuningOverrideInput('minLight', this.value)">
-                <div class="tune-val" id="tuneMinLightVal">-</div>
-              </div>
-              <div class="tune-row">
-                <label for="tuneMinEdge">Min Edge</label>
-                <input id="tuneMinEdge" type="range" min="20" max="90" step="1" oninput="onTuningOverrideInput('minEdge', this.value)">
-                <div class="tune-val" id="tuneMinEdgeVal">-</div>
-              </div>
-              <div class="tune-row">
-                <label for="tuneMinVariance">Min Blur Score</label>
-                <input id="tuneMinVariance" type="range" min="90" max="360" step="2" oninput="onTuningOverrideInput('minVariance', this.value)">
-                <div class="tune-val" id="tuneMinVarianceVal">-</div>
-              </div>
-              <div class="tune-row">
-                <label for="tuneCenterY">Crop Center Y</label>
-                <input id="tuneCenterY" type="range" min="48" max="66" step="1" oninput="onTuningOverrideInput('centerY', this.value)">
-                <div class="tune-val" id="tuneCenterYVal">-</div>
-              </div>
-              <div class="tune-row">
-                <label for="tuneHeightRatio">Crop Height</label>
-                <input id="tuneHeightRatio" type="range" min="22" max="38" step="1" oninput="onTuningOverrideInput('heightRatio', this.value)">
-                <div class="tune-val" id="tuneHeightRatioVal">-</div>
-              </div>
-              <div class="tune-row">
-                <label for="tuneWidthRatio">Crop Width</label>
-                <input id="tuneWidthRatio" type="range" min="86" max="99" step="1" oninput="onTuningOverrideInput('widthRatio', this.value)">
-                <div class="tune-val" id="tuneWidthRatioVal">-</div>
-              </div>
-            </div>
-            <div style="display:flex;justify-content:flex-end;margin-top:8px;">
-              <button class="btn btn-ghost btn-sm" onclick="resetTuningOverrides()">Reset Advanced</button>
-            </div>
-          </details>
-          <div class="input-row">
-            <input class="input-f" id="manualInput" placeholder="Type serial…" onkeydown="if(event.key==='Enter') saveManual()">
-            <button class="btn btn-red btn-sm" id="manualSaveBtn" onclick="saveManual()">Save</button>
-          </div>
-          <div class="queue-box">
-            <div class="check-box" id="checkBox" style="margin-top:0;padding-top:0;border-top:none;">
-              <div class="check-title">Import to check.csv</div>
-              <div class="import-actions" id="importActions">
-                <button class="btn btn-ghost btn-sm" onclick="startImportLive()">📹 Use Live Camera</button>
-                <button class="btn btn-ghost btn-sm" onclick="capturePhotoForImport()">📸 Capture Add</button>
-              </div>
-              <div class="import-note">Use camera in Import mode, then tap Continue on popup to add.</div>
-              <div class="check-head">
-                <span>check.csv loaded: <strong id="checkCount">0</strong></span>
-                <button class="btn btn-ghost btn-sm" onclick="loadCheckset(true)">Load check.csv</button>
-                <button class="btn btn-ghost btn-sm" onclick="showBulkImport()">Bulk Import</button>
-              </div>
-              <div class="check-preview" id="checkPreview">-</div>
-              <div class="check-form">
-                <input class="queue-input" id="checkAddInput" placeholder="Serial to add">
-                <button class="btn btn-ghost btn-sm" onclick="addChecklistFromForm()">Add</button>
-              </div>
-              <label class="queue-link">
-                <input type="checkbox" id="checkApprove"> Approve add to check.csv
-                <span id="checkConfLabel">conf 0%</span>
-              </label>
-            </div>
-
-            <!-- Box Box -->
-            <div class="check-box" id="boxContainer" style="display:none; margin-top:0; padding-top:0; border-top:none;">
-              <div class="check-title">Box Inventory</div>
-              <div class="box-controls" style="display:flex; gap:10px; margin-bottom:12px;">
-                <select class="queue-select" id="boxSel" style="flex:1;" onchange="onBoxChange()"></select>
-                <button class="btn btn-ghost btn-sm" onclick="showBoxCreate()">+ New Box</button>
-              </div>
-              <div class="box-lobby" id="boxLobbyList"></div>
-              <div id="boxStatusCard" style="display:none;">
-                <div class="meter-row" style="font-size:11px; margin-bottom:4px;">
-                  <span id="boxStatsText">0/0 scanned</span>
-                  <span id="boxPercentText">0%</span>
-                </div>
-                <div class="meter-track" style="height:10px; margin-bottom:12px;"><div class="meter-fill meter-pool" id="boxProgressFill" style="width:0%;"></div></div>
-                <div class="box-collabs" id="boxCollabs">No collaborators yet.</div>
-                <div class="box-found" id="boxFoundFlash">Waiting for matched serial…</div>
-                <div style="display:flex; gap:8px; margin-bottom:12px;">
-                  <button class="btn btn-ghost btn-sm" style="flex:1;" onclick="showBoxImport()">📄 Import Target</button>
-                  <button class="btn btn-ghost btn-sm" style="flex:1;" id="boxCloseBtn" onclick="toggleBoxClosed()">🔒 Close Box</button>
-                </div>
-                <div style="display:flex; gap:8px; margin-bottom:12px;">
-                  <button class="btn btn-ghost btn-sm" style="flex:1;" onclick="downloadBoxSummary()">⬇ Box CSV</button>
-                  <button class="btn btn-danger btn-sm" onclick="deleteActiveBox()">✕ Delete</button>
-                </div>
-                <div class="check-head">
-                  <span id="boxMissingTitle">Missing Serials</span>
-                  <button class="btn btn-ghost btn-sm" id="boxMissingToggleBtn" onclick="toggleBoxMissing()">Show List</button>
-                </div>
-                <div class="check-preview" id="boxMissingList" style="display:none; max-height:120px; overflow-y:auto; text-align:left; font-size:11px;">-</div>
-              </div>
-            </div>
-          </div>
-          <div class="banner" id="banner"></div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Live Feed -->
-    <div>
-      <div class="card">
-          <div class="card-head">
-            <div class="card-title" id="feedTitle">⚡ Live Feed</div>
-            <div class="head-actions">
-              <button class="btn btn-green btn-sm" onclick="downloadCSV()">⬇ CSV</button>
-              <button class="btn btn-green btn-sm" onclick="downloadCropManifest()">⬇ Crops CSV</button>
-              <button class="btn btn-danger btn-sm" onclick="clearAll()">✕ Clear</button>
-            </div>
-        </div>
-        <div class="card-body">
-          <input class="search" id="searchBox" placeholder="Search…" oninput="renderFeed()">
-          <div class="feed-count" id="feedCount">0 items</div>
-          <div class="feed" id="feedList">
-            <div class="feed-empty"><div class="icon">📡</div>Waiting for scans…</div>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Online Users -->
-    <div>
-      <div class="card">
-        <div class="card-head">
-          <div class="card-title">👥 Online Users</div>
-        </div>
-        <div class="card-body">
-          <div class="users-list" id="usersList">
-            <div class="feed-empty"><div class="icon">👤</div>No users connected</div>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- OCR Performance -->
-    <div>
-      <div class="card">
-        <div class="card-head">
-          <div class="card-title">🧠 M4 OCR Engine</div>
-          <div class="status-pill status-idle" id="mStatus">Idle</div>
-        </div>
-        <div class="card-body">
-          <div class="mini-stats">
-            <div class="mini-stat">
-              <div class="mini-stat-label">Scanning Now</div>
-              <div class="mini-stat-value" id="mActive">0</div>
-            </div>
-            <div class="mini-stat">
-              <div class="mini-stat-label">Workers Busy</div>
-              <div class="mini-stat-value" id="mPool">0/0</div>
-            </div>
-            <div class="mini-stat">
-              <div class="mini-stat-label">Avg OCR</div>
-              <div class="mini-stat-value" id="mLatency">0ms</div>
-            </div>
-            <div class="mini-stat">
-              <div class="mini-stat-label">OCR Confidence</div>
-              <div class="mini-stat-value" id="mMatch">0%</div>
-            </div>
-          </div>
-          <div class="meter-wrap">
-            <div class="meter-row">
-              <span>Worker Utilization</span>
-              <span id="mUtilText">0%</span>
-            </div>
-            <div class="meter-track"><div class="meter-fill meter-pool" id="mUtilFill"></div></div>
-            <div class="meter-row">
-              <span>OCR Confidence</span>
-              <span id="mHitText">0%</span>
-            </div>
-            <div class="meter-track"><div class="meter-fill meter-hit" id="mHitFill"></div></div>
-          </div>
-          <div class="mini-note" id="mNote">Waiting for scan sessions…</div>
-        </div>
-      </div>
-    </div>
-  </div>
-</div>
-
-<div class="hold-overlay" id="scanHoldOverlay" onclick="ignoreScanHold()"></div>
-<div class="hold-card" id="scanHold">
-  <div class="hold-title">Scan Complete</div>
-  <div class="hold-check-icon" id="holdCheckIcon" style="display:none;">✔ Listed in CSV</div>
-  <img id="holdCropImage" src="" alt="Cropped scan preview" style="display:none; width:100%; border-radius:10px; border:1px solid var(--border); margin-bottom:8px; max-height:180px; object-fit:contain; background:#000;">
-  <div class="hold-serial" id="holdSerial">-</div>
-  <div class="hold-meta" id="holdMeta">Review result, then continue scanning.</div>
-  <div class="hold-actions">
-    <button class="btn btn-red" onclick="continueAfterScan()">Continue</button>
-    <button class="btn btn-ghost" onclick="ignoreScanHold()">Ignore</button>
-  </div>
-</div>
-
-<div class="toasts" id="toasts"></div>
-
-<div class="modal-bg" id="cropPreviewModal" style="display:none;" onclick="if(event.target===this) closeCropPreview()">
-  <div class="modal" style="max-width:min(96vw, 900px); width:min(96vw,900px);">
-    <h2 style="margin-bottom:8px;">Cropped Preview</h2>
-    <p id="cropPreviewMeta" style="margin-bottom:12px;">-</p>
-    <img id="cropPreviewImage" src="" alt="Crop preview" style="display:block; width:100%; max-height:72vh; object-fit:contain; border-radius:12px; border:1px solid var(--border); background:#000;">
-    <div style="display:flex; gap:10px; margin-top:14px;">
-      <button class="btn btn-ghost" onclick="closeCropPreview()">Close</button>
-      <button class="btn btn-red" onclick="downloadCropPreview()">Download</button>
-    </div>
-  </div>
-</div>
-
-<script src="/static/vendor/socket.io.min.js?v=__APP_BUILD_ID__"></script>
-<script src="https://cdn.jsdelivr.net/npm/html5-qrcode@2.3.8/html5-qrcode.min.js?v=__APP_BUILD_ID__"></script>
-<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js?v=__APP_BUILD_ID__"></script>
-<script>
-// ============================================
-// State
-// ============================================
-let sock = null;
-let scanner = null;
-let isScanning = false;
-let scanHistory = [];
-let cameras = [];
-let selectedCam = null;
-let userName = localStorage.getItem('nab_scanner_name') || '';
-let userPin = '';
-let clientId = localStorage.getItem('nab_scanner_client_id') || '';
-let sessionToken = localStorage.getItem('nab_session_token') || '';
-let joinPin = '';
-let appBootstrapped = false;
-let currentSessionId = '';
-let lastCode = '';
-let lastCodeTime = 0;
-const userColors = {};
-const colorPalette = [
-  '#C8102E','#3B82F6','#10B981','#F59E0B','#8B5CF6',
-  '#EC4899','#06B6D4','#F97316','#14B8A6','#6366F1'
-];
-let colorIdx = 0;
-
-let ocrRunning = false;
-let ocrTimer = null;
-let ocrAwaitingServer = false;
-let ocrAwaitTimeoutTimer = null;
-let photoProcessing = false;
-let photoSendPending = false;
-let photoSendTimeoutTimer = null;
-let photoOnlyStream = null;
-const DEFAULT_OCR_DELAY_MS = 700;
-let ocrDelayMs = 700;
-let ocrBackpressureScore = 0;
-let liveCaptureQuality = 0.72;
-let liveCaptureWidth = 1500;
-let latestOcrSerial = '';
-let latestOcrAt = 0;
-let latestOcrConfidence = 0;
-let latestOcrCropImage = '';
-let lastSubmittedCropImage = '';
-let processingMode = '';
-let scanHoldActive = false;
-let lastGuideHint = '';
-let holdSerialValue = '';
-let holdScanPending = null;
-let sharedLanes = [];
-let selectedLane = localStorage.getItem('nab_selected_lane') || 'General';
-let allBoxes = {};
-let selectedBoxId = '';
-let boxMissingVisible = false;
-let boxFoundFlashTimer = null;
-let lastBoxFoundSerial = '';
-let pendingBoxJoinId = '';
-let laneAutoAssign = localStorage.getItem('nab_lane_auto_assign') !== '0';
-let allowedCheckSet = new Set();
-let checksetLastLoadedAt = 0;
-let activeFunction = localStorage.getItem('nab_active_function') || 'inventory';
-let serialProfile = (localStorage.getItem('nab_serial_profile') || 'apple').toLowerCase();
-if (serialProfile !== 'apple' && serialProfile !== 'dell') serialProfile = 'apple';
-let lastConnectErrorToastAt = 0;
-let cameraPreference = localStorage.getItem('nab_camera_pref') || 'environment';
-let cameraTuningProfile = (localStorage.getItem('nab_camera_tuning_profile') || 'auto').toLowerCase();
-if (!['auto', 'iphone', 'android', 'desktop', 'aggressive'].includes(cameraTuningProfile)) cameraTuningProfile = 'auto';
-let cameraTuningOverrides = {};
-try {
-  const raw = localStorage.getItem('nab_camera_tuning_overrides');
-  if (raw) cameraTuningOverrides = JSON.parse(raw) || {};
-} catch (_e) { cameraTuningOverrides = {}; }
-let autosavePref = localStorage.getItem('nab_autosave_pref');
-if (autosavePref !== '0' && autosavePref !== '1') autosavePref = '1';
-let autoScanStartPref = localStorage.getItem('nab_auto_scan_start');
-if (autoScanStartPref !== '0' && autoScanStartPref !== '1') autoScanStartPref = '1';
-let previewCropFilename = '';
-let qrRequestTimer = null;
-let qrRequestInFlight = false;
-let autoBoxCreatePending = false;
-let pendingSocketEmits = [];
-let socketIoClientLoading = false;
-let settingsSyncTimer = null;
-let settingsAppliedFromServer = false;
-let isUserAuthenticated = false;
-let lastAudioAt = 0;
-let goodFrameStreak = 0;
-let badFrameStreak = 0;
-
-function saveJoinPin(pin) {
-  const val = String(pin || '').trim();
-  joinPin = val;
-  if (!val) return;
-  localStorage.setItem('nab_scanner_pin', val);
-  syncSocketAuthPayload();
-}
-
-function clearJoinPinCache() {
-  joinPin = '';
-  localStorage.removeItem('nab_scanner_pin');
-  syncSocketAuthPayload();
-}
-
-function saveSessionToken(token) {
-  const val = String(token || '').trim();
-  sessionToken = val;
-  if (!val) {
-    localStorage.removeItem('nab_session_token');
-    syncSocketAuthPayload();
-    return;
-  }
-  localStorage.setItem('nab_session_token', val);
-  syncSocketAuthPayload();
-}
-
-function clearSessionTokenCache() {
-  sessionToken = '';
-  localStorage.removeItem('nab_session_token');
-  syncSocketAuthPayload();
-}
-
-function resetSocketClient() {
-  try {
-    if (sock) {
-      try { sock.removeAllListeners(); } catch (_e) {}
-      try { sock.disconnect(); } catch (_e) {}
-    }
-  } catch (_e) {}
-  sock = null;
-}
-
-function loadJoinPinCache() {
-  const fromLocal = (localStorage.getItem('nab_scanner_pin') || '').trim();
-  if (fromLocal) {
-    joinPin = fromLocal;
-    return fromLocal;
-  }
-  joinPin = '';
-  return '';
-}
-
-function saveSelectedBox(boxId) {
-  const id = String(boxId || '').trim();
-  const changed = selectedBoxId !== id;
-  selectedBoxId = id;
-  if (id) localStorage.setItem('nab_selected_box_id', id);
-  else localStorage.removeItem('nab_selected_box_id');
-  if (changed && settingsAppliedFromServer) scheduleUserSettingsSync();
-}
-
-function loadSelectedBoxCache() {
-  const cached = (localStorage.getItem('nab_selected_box_id') || '').trim();
-  if (cached) selectedBoxId = cached;
-}
-
-function setSettingsPill(state = 'local', text = '') {
-  const el = document.getElementById('settingsPill');
-  if (!el) return;
-  el.classList.remove('ok', 'warn');
-  if (state === 'ok') el.classList.add('ok');
-  if (state === 'warn') el.classList.add('warn');
-  if (text) {
-    el.textContent = text;
-    return;
-  }
-  if (state === 'ok') el.textContent = 'Prefs synced';
-  else if (state === 'warn') el.textContent = 'Prefs pending';
-  else el.textContent = 'Prefs local';
-}
-
-function setAuthPill(state = 'required', text = '') {
-  const el = document.getElementById('authPill');
-  if (!el) return;
-  el.classList.remove('ok', 'req');
-  if (state === 'ok') el.classList.add('ok');
-  if (state === 'required') el.classList.add('req');
-  if (text) {
-    el.textContent = text;
-    return;
-  }
-  if (state === 'ok') el.textContent = 'Authenticated';
-  else if (state === 'session') el.textContent = 'Join OK • login required';
-  else el.textContent = 'Auth required';
-}
-
-function syncSocketAuthPayload() {
-  if (!sock) return;
-  sock.auth = {
-    client_id: clientId,
-    name: userName || 'Anonymous',
-    pin: joinPin || '',
-    session_token: sessionToken || '',
-    serial_profile: serialProfile,
-  };
-}
-
-function updateModePill() {
-  const el = document.getElementById('modePill');
-  if (!el) return;
-  const modeMap = {
-    inventory: 'Inventory',
-    box: 'Box',
-    import: 'Import',
-  };
-  const profileMap = {
-    apple: 'Apple',
-    dell: 'Dell',
-  };
-  const modeLabel = modeMap[activeFunction] || 'Inventory';
-  const profileLabel = profileMap[serialProfile] || 'Apple';
-  el.textContent = `${modeLabel} • ${profileLabel}`;
-}
-
-function applyCameraPreferenceToUI() {
-  const sel = document.getElementById('cameraSel');
-  if (!sel) return;
-  const desired = (cameraPreference || 'environment').trim();
-  const hasOption = Array.from(sel.options || []).some((o) => o.value === desired);
-  if (hasOption) {
-    sel.value = desired;
-  } else if (desired === 'environment' || desired === 'user') {
-    sel.value = desired;
-  }
-}
-
-function normalizeCameraTuningProfile(value) {
-  const v = String(value || '').trim().toLowerCase();
-  return ['auto', 'iphone', 'android', 'desktop', 'aggressive'].includes(v) ? v : 'auto';
-}
-
-function normalizeCameraTuningOverrides(input) {
-  const src = (input && typeof input === 'object') ? input : {};
-  const out = {};
-  const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
-  if (src.minLight != null && !Number.isNaN(Number(src.minLight))) out.minLight = clamp(Number(src.minLight), 28, 72);
-  if (src.minEdge != null && !Number.isNaN(Number(src.minEdge))) out.minEdge = clamp(Number(src.minEdge), 0.020, 0.090);
-  if (src.minVariance != null && !Number.isNaN(Number(src.minVariance))) out.minVariance = clamp(Number(src.minVariance), 90, 360);
-  if (src.centerY != null && !Number.isNaN(Number(src.centerY))) out.centerY = clamp(Number(src.centerY), 0.48, 0.66);
-  if (src.heightRatio != null && !Number.isNaN(Number(src.heightRatio))) out.heightRatio = clamp(Number(src.heightRatio), 0.22, 0.38);
-  if (src.widthRatio != null && !Number.isNaN(Number(src.widthRatio))) out.widthRatio = clamp(Number(src.widthRatio), 0.86, 0.99);
-  return out;
-}
-
-function saveCameraTuningOverrides() {
-  cameraTuningOverrides = normalizeCameraTuningOverrides(cameraTuningOverrides);
-  localStorage.setItem('nab_camera_tuning_overrides', JSON.stringify(cameraTuningOverrides));
-}
-
-function renderAdvancedTuningPanel() {
-  const normalized = normalizeCameraTuningOverrides(cameraTuningOverrides);
-  cameraTuningOverrides = normalized;
-  const setVal = (id, val) => {
-    const el = document.getElementById(id);
-    if (el) el.textContent = val;
-  };
-  const setRange = (id, val) => {
-    const el = document.getElementById(id);
-    if (el && !Number.isNaN(Number(val))) el.value = String(val);
-  };
-  setRange('tuneMinLight', normalized.minLight ?? 45);
-  setRange('tuneMinEdge', Math.round((normalized.minEdge ?? 0.042) * 1000));
-  setRange('tuneMinVariance', normalized.minVariance ?? 170);
-  setRange('tuneCenterY', Math.round((normalized.centerY ?? 0.56) * 100));
-  setRange('tuneHeightRatio', Math.round((normalized.heightRatio ?? 0.30) * 100));
-  setRange('tuneWidthRatio', Math.round((normalized.widthRatio ?? 0.94) * 100));
-  setVal('tuneMinLightVal', `${Math.round(normalized.minLight ?? 45)}`);
-  setVal('tuneMinEdgeVal', `${(normalized.minEdge ?? 0.042).toFixed(3)}`);
-  setVal('tuneMinVarianceVal', `${Math.round(normalized.minVariance ?? 170)}`);
-  setVal('tuneCenterYVal', `${Math.round((normalized.centerY ?? 0.56) * 100)}%`);
-  setVal('tuneHeightRatioVal', `${Math.round((normalized.heightRatio ?? 0.30) * 100)}%`);
-  setVal('tuneWidthRatioVal', `${Math.round((normalized.widthRatio ?? 0.94) * 100)}%`);
-}
-
-function getDeviceCameraClass() {
-  const ua = navigator.userAgent || '';
-  if (/iPhone|iPad|iPod/i.test(ua)) return 'iphone';
-  if (/Android/i.test(ua)) return 'android';
-  return 'desktop';
-}
-
-function getActiveCameraTuningProfile() {
-  if (cameraTuningProfile !== 'auto') return cameraTuningProfile;
-  return getDeviceCameraClass();
-}
-
-function getCameraTuningConfig() {
-  const profile = getActiveCameraTuningProfile();
-  const overrides = normalizeCameraTuningOverrides(cameraTuningOverrides);
-  let base;
-  if (profile === 'iphone') {
-    base = { widthRatio: 0.96, heightRatio: 0.29, centerY: 0.56, qualityWidth: 1500, minLight: 40, minEdge: 0.036, minVariance: 150 };
-  } else if (profile === 'android') {
-    base = { widthRatio: 0.93, heightRatio: 0.31, centerY: 0.57, qualityWidth: 1500, minLight: 48, minEdge: 0.045, minVariance: 188 };
-  } else if (profile === 'aggressive') {
-    base = { widthRatio: 0.92, heightRatio: 0.34, centerY: 0.56, qualityWidth: 1700, minLight: 52, minEdge: 0.052, minVariance: 220 };
-  } else {
-    base = { widthRatio: 0.94, heightRatio: 0.30, centerY: 0.56, qualityWidth: 1500, minLight: 45, minEdge: 0.042, minVariance: 170 };
-  }
-  return { ...base, ...overrides };
-}
-
-function collectUserSettings() {
-  return {
-    active_function: activeFunction,
-    serial_profile: serialProfile,
-    camera_pref: cameraPreference,
-    camera_tuning_profile: cameraTuningProfile,
-    camera_tuning_overrides: normalizeCameraTuningOverrides(cameraTuningOverrides),
-    autosave_pref: autosavePref,
-    auto_scan_start: autoScanStartPref,
-    selected_box_id: selectedBoxId || '',
-  };
-}
-
-function scheduleUserSettingsSync() {
-  if (settingsSyncTimer) clearTimeout(settingsSyncTimer);
-  setSettingsPill('warn');
-  settingsSyncTimer = setTimeout(() => {
-    if (!(sock && sock.connected)) return;
-    sock.emit('save_user_settings', { settings: collectUserSettings() });
-  }, 220);
-}
-
-function applyServerSettings(payload, opts = {}) {
-  const s = payload && typeof payload === 'object' ? payload : {};
-  const prevCameraPref = cameraPreference;
-  if (s.active_function === 'inventory' || s.active_function === 'box' || s.active_function === 'import') {
-    activeFunction = s.active_function;
-    localStorage.setItem('nab_active_function', activeFunction);
-  }
-  if (s.serial_profile === 'apple' || s.serial_profile === 'dell') {
-    serialProfile = s.serial_profile;
-    localStorage.setItem('nab_serial_profile', serialProfile);
-  }
-  if (typeof s.camera_pref === 'string' && s.camera_pref.trim()) {
-    cameraPreference = s.camera_pref.trim();
-    localStorage.setItem('nab_camera_pref', cameraPreference);
-  }
-  if (typeof s.camera_tuning_profile === 'string' && s.camera_tuning_profile.trim()) {
-    cameraTuningProfile = normalizeCameraTuningProfile(s.camera_tuning_profile);
-    localStorage.setItem('nab_camera_tuning_profile', cameraTuningProfile);
-  }
-  if (s.camera_tuning_overrides && typeof s.camera_tuning_overrides === 'object') {
-    cameraTuningOverrides = normalizeCameraTuningOverrides(s.camera_tuning_overrides);
-    saveCameraTuningOverrides();
-  }
-  if (s.autosave_pref === '0' || s.autosave_pref === '1') {
-    autosavePref = s.autosave_pref;
-    localStorage.setItem('nab_autosave_pref', autosavePref);
-  }
-  if (s.auto_scan_start === '0' || s.auto_scan_start === '1') {
-    autoScanStartPref = s.auto_scan_start;
-    localStorage.setItem('nab_auto_scan_start', autoScanStartPref);
-  }
-  if (typeof s.selected_box_id === 'string') {
-    saveSelectedBox(s.selected_box_id);
-  }
-  settingsAppliedFromServer = true;
-  if (!opts.skipRender) {
-    updateFunctionModeUI();
-    applyCameraPreferenceToUI();
-    renderBoxes();
-    renderQueue();
-    renderAdvancedTuningPanel();
-  }
-  updateModePill();
-  if (!opts.skipToast) {
-    setSettingsPill('ok');
-  }
-  if (isScanning && !opts.skipRender && cameraPreference !== prevCameraPref) {
-    // Apply restored camera preference on active scanner with a safe restart.
-    stopScanner().then(() => setTimeout(startScanner, 220));
-  }
-  if (!opts.skipRender) {
-    maybeAutoStartScanner('settings');
-  }
-}
-
-async function clearAppCache() {
-  const ok = confirm('Clear local cache and reload?');
-  if (!ok) return;
-  try {
-    Object.keys(localStorage).forEach((k) => {
-      if (k.startsWith('nab_')) localStorage.removeItem(k);
-    });
-    if ('caches' in window) {
-      const names = await caches.keys();
-      await Promise.all(names.map((n) => caches.delete(n)));
-    }
-    if ('serviceWorker' in navigator) {
-      const regs = await navigator.serviceWorker.getRegistrations();
-      await Promise.all(regs.map((r) => r.unregister()));
-    }
-  } catch (_e) {}
-  window.location.href = `${window.location.origin}${window.location.pathname}?v=${Date.now()}`;
-}
-
-function logoutSession() {
-  if (!confirm('Logout current user session?')) return;
-  isUserAuthenticated = false;
-  clearOcrAwaitState();
-  pendingSocketEmits = [];
-  if (isScanning) stopScanner();
-  setAuthPill('required');
-  try { if (sock) sock.emit('logout_session'); } catch (_e) {}
-  resetSocketClient();
-  localStorage.removeItem('nab_scanner_name');
-  localStorage.removeItem('nab_scanner_client_id');
-  clearJoinPinCache();
-  clearSessionTokenCache();
-  setTimeout(() => {
-    window.location.href = `${window.location.origin}${window.location.pathname}?v=${Date.now()}`;
-  }, 180);
-}
-
-function setProcessingState(mode, active, detail = '') {
-  processingMode = active ? mode : '';
-  const el = document.getElementById('procNote');
-  if (!el) return;
-  el.classList.toggle('active', active);
-  if (!active) {
-    el.textContent = 'Ready.';
-    return;
-  }
-  const label = mode === 'photo' ? 'Processing photo' : 'Processing live frame';
-  el.textContent = detail ? `${label} • ${detail}` : `${label}...`;
-}
-
-function setGuideChip(text, level = 'guide') {
-  const el = document.getElementById('guideChip');
-  if (!el) return;
-  const next = String(text || '').trim();
-  if (!next) return;
-  if (lastGuideHint === `${level}:${next}`) return;
-  lastGuideHint = `${level}:${next}`;
-  el.textContent = next;
-  el.classList.remove('warn', 'ok');
-  if (level === 'warn') el.classList.add('warn');
-  else if (level === 'ok') el.classList.add('ok');
-}
-
-function updateCaptureControls() {
-  const startBtn = document.getElementById('startBtn');
-  const stopBtn = document.getElementById('stopBtn');
-  const photoBtn = document.getElementById('photoBtn');
-  const busy = photoSendPending || photoProcessing || ocrAwaitingServer;
-  if (startBtn) startBtn.disabled = isScanning || busy;
-  if (stopBtn) stopBtn.disabled = !isScanning || busy;
-  if (photoBtn) photoBtn.disabled = !isUserAuthenticated || busy;
-}
-
-function setPhotoSendPending(active) {
-  photoSendPending = !!active;
-  if (photoSendTimeoutTimer) {
-    clearTimeout(photoSendTimeoutTimer);
-    photoSendTimeoutTimer = null;
-  }
-  if (photoSendPending) {
-    setProcessingState('photo', true, 'uploading');
-    photoSendTimeoutTimer = setTimeout(() => {
-      if (!photoSendPending) return;
-      photoSendPending = false;
-      setProcessingState('photo', false);
-      showBanner('Photo upload timeout. Please capture again.', 'warning');
-      updateCaptureControls();
-    }, 5000);
-  }
-  updateCaptureControls();
-}
-
-function clearOcrAwaitState() {
-  if (ocrAwaitTimeoutTimer) {
-    clearTimeout(ocrAwaitTimeoutTimer);
-    ocrAwaitTimeoutTimer = null;
-  }
-  if (photoSendTimeoutTimer) {
-    clearTimeout(photoSendTimeoutTimer);
-    photoSendTimeoutTimer = null;
-  }
-  photoSendPending = false;
-  ocrAwaitingServer = false;
-  photoProcessing = false;
-  setProcessingState(processingMode || 'live', false);
-  updateCaptureControls();
-}
-
-function armOcrAwaitTimeout(kind = 'live') {
-  if (ocrAwaitTimeoutTimer) clearTimeout(ocrAwaitTimeoutTimer);
-  ocrAwaitTimeoutTimer = setTimeout(() => {
-    if (!ocrAwaitingServer && !photoProcessing) return;
-    clearOcrAwaitState();
-    const label = kind === 'photo' ? 'photo' : 'live scan';
-    showBanner(`Server response timeout on ${label}. Retrying…`, 'warning');
-    if (isScanning && kind !== 'photo') queueNextOcr(260);
-  }, kind === 'photo' ? 10000 : 7000);
-}
-
-function showScanHold(serial, isDupe, autosaved, cropImage = '', isListed = null) {
-  scanHoldActive = true;
-  holdSerialValue = serial;
-  holdScanPending = {
-    serial,
-    isDupe,
-    autosaved,
-    confidence: latestOcrConfidence,
-    crop_image: cropImage || latestOcrCropImage || '',
-    is_listed: typeof isListed === 'boolean' ? isListed : null,
-  };
-  const hold = document.getElementById('scanHold');
-  const overlay = document.getElementById('scanHoldOverlay');
-  const serialEl = document.getElementById('holdSerial');
-  const metaEl = document.getElementById('holdMeta');
-  const imgEl = document.getElementById('holdCropImage');
-  const checkIconEl = document.getElementById('holdCheckIcon');
-  if (serialEl) serialEl.textContent = serial;
-  if (imgEl) {
-    const src = holdScanPending?.crop_image || '';
-    if (src) {
-      imgEl.src = src;
-      imgEl.style.display = 'block';
-    } else {
-      imgEl.src = '';
-      imgEl.style.display = 'none';
-    }
-  }
-  if (metaEl) {
-    const fallbackListed = (() => {
-      const inCheckCsv = allowedCheckSet.size > 0 && allowedCheckSet.has(serial);
-      const inBoxCsv = (
-        activeFunction === 'box'
-        && !!selectedBoxId
-        && !!allBoxes[selectedBoxId]
-        && Array.isArray(allBoxes[selectedBoxId].target)
-        && allBoxes[selectedBoxId].target.includes(serial)
-      );
-      return inCheckCsv || inBoxCsv;
-    })();
-    const isListed = typeof holdScanPending?.is_listed === 'boolean' ? holdScanPending.is_listed : fallbackListed;
-    if (checkIconEl) checkIconEl.style.display = isListed ? 'inline-flex' : 'none';
-    const checkedText = isListed ? '✓ listed in CSV' : 'Not listed in CSV';
-    const confText = `confidence ${Math.round((holdScanPending?.confidence || 0) * 100)}%`;
-    if (autosaved) {
-      metaEl.textContent = isDupe
-        ? `Duplicate detected. ${checkedText}. ${confText}. Continue or ignore.`
-        : `${checkedText}. ${confText}. Continue or ignore.`;
-    } else {
-      metaEl.textContent = isDupe
-        ? `Duplicate detected. ${checkedText}. ${confText}. Continue or ignore.`
-        : `${checkedText}. ${confText}. Continue or ignore.`;
-    }
-  }
-  const addInput = document.getElementById('checkAddInput');
-  const confLabel = document.getElementById('checkConfLabel');
-  if (addInput) addInput.value = serial;
-  if (confLabel) confLabel.textContent = `conf ${Math.round((holdScanPending?.confidence || 0) * 100)}%`;
-  if (overlay) overlay.classList.add('show');
-  if (hold) hold.classList.add('show');
-}
-
-function hideScanHold() {
-  scanHoldActive = false;
-  holdSerialValue = '';
-  holdScanPending = null;
-  const imgEl = document.getElementById('holdCropImage');
-  const checkIconEl = document.getElementById('holdCheckIcon');
-  if (imgEl) {
-    imgEl.src = '';
-    imgEl.style.display = 'none';
-  }
-  if (checkIconEl) checkIconEl.style.display = 'none';
-  const hold = document.getElementById('scanHold');
-  const overlay = document.getElementById('scanHoldOverlay');
-  if (overlay) overlay.classList.remove('show');
-  if (hold) hold.classList.remove('show');
-}
-
-function resumeScanFlow() {
-  hideScanHold();
-  if (scanner && isScanning) {
-    try { scanner.resume(); } catch(e) {}
-    queueNextOcr(180);
-  }
-}
-
-function continueAfterScan() {
-  if (holdScanPending) {
-    if (activeFunction === 'import') {
-      const approved = !!document.getElementById('checkApprove')?.checked;
-      const confidence = holdScanPending?.confidence || 0;
-      sock.emit('add_to_checklist', { serial: holdScanPending.serial, approved, confidence, serial_profile: serialProfile });
-    } else {
-      if (!selectedBoxId) {
-        showBanner('Select or create a box first.', 'warning');
-        return;
-      }
-      const payload = { 
-        serial: holdScanPending.serial, 
-        method: 'camera', 
-        user: userName,
-        function_mode: activeFunction,
-        box_id: selectedBoxId || null,
-        ocr_confidence: holdScanPending?.confidence || 0,
-        crop_image: holdScanPending?.crop_image || ''
-      };
-      payload.serial_profile = serialProfile;
-      sock.emit('save_scan', payload);
-    }
-  }
-  resumeScanFlow();
-}
-
-function ignoreScanHold() {
-  resumeScanFlow();
-}
-
-function addChecklistFromForm() {
-  if (!sock) return;
-  const serial = (document.getElementById('checkAddInput')?.value || '').trim();
-  const approved = !!document.getElementById('checkApprove')?.checked;
-  const confidence = holdScanPending?.confidence || 0;
-  if (!serial) return;
-  sock.emit('add_to_checklist', { serial, approved, confidence, manual: true, serial_profile: serialProfile });
-}
-
-function normalizeSerialProfile(profile) {
-  const p = String(profile || '').toLowerCase();
-  return p === 'dell' ? 'dell' : 'apple';
-}
-
-function setSerialProfile(profile) {
-  const next = normalizeSerialProfile(profile);
-  if (serialProfile === next) return;
-  serialProfile = next;
-  localStorage.setItem('nab_serial_profile', serialProfile);
-  allowedCheckSet = new Set();
-  checksetLastLoadedAt = 0;
-  updateFunctionModeUI();
-  loadCheckset(true);
-  if (sock) {
-    sock.emit('scanner_state', { scanning: !!isScanning, serial_profile: serialProfile });
-  }
-  if (settingsAppliedFromServer) scheduleUserSettingsSync();
-}
-
-function setFunctionMode(mode) {
-  if (mode === 'import' || mode === 'box' || mode === 'inventory') activeFunction = mode;
-  else activeFunction = 'inventory';
-  localStorage.setItem('nab_active_function', activeFunction);
-  updateFunctionModeUI();
-  if (settingsAppliedFromServer) scheduleUserSettingsSync();
-}
-
-function onAutosaveChange() {
-  const cb = document.getElementById('autosave');
-  autosavePref = (cb && cb.checked) ? '1' : '0';
-  localStorage.setItem('nab_autosave_pref', autosavePref);
-  if (settingsAppliedFromServer) scheduleUserSettingsSync();
-}
-
-function onAutoScanStartChange() {
-  const cb = document.getElementById('autoScanStart');
-  autoScanStartPref = (cb && cb.checked) ? '1' : '0';
-  localStorage.setItem('nab_auto_scan_start', autoScanStartPref);
-  if (settingsAppliedFromServer) scheduleUserSettingsSync();
-  if (autoScanStartPref === '1') maybeAutoStartScanner('toggle');
-}
-
-function onCameraTuningProfileChange() {
-  const sel = document.getElementById('cameraTuningSel');
-  cameraTuningProfile = normalizeCameraTuningProfile(sel ? sel.value : cameraTuningProfile);
-  localStorage.setItem('nab_camera_tuning_profile', cameraTuningProfile);
-  const active = getActiveCameraTuningProfile();
-  setGuideChip(`🎛 Tuning: ${active}`, 'guide');
-  renderAdvancedTuningPanel();
-  if (settingsAppliedFromServer) scheduleUserSettingsSync();
-}
-
-function onTuningOverrideInput(key, rawValue) {
-  const num = Number(rawValue);
-  if (Number.isNaN(num)) return;
-  if (key === 'minEdge') cameraTuningOverrides[key] = num / 1000;
-  else if (key === 'centerY' || key === 'heightRatio' || key === 'widthRatio') cameraTuningOverrides[key] = num / 100;
-  else cameraTuningOverrides[key] = num;
-  saveCameraTuningOverrides();
-  renderAdvancedTuningPanel();
-  setGuideChip(`🎛 Tuning: ${getActiveCameraTuningProfile()}`, 'guide');
-  if (settingsAppliedFromServer) scheduleUserSettingsSync();
-}
-
-function resetTuningOverrides() {
-  cameraTuningOverrides = {};
-  saveCameraTuningOverrides();
-  renderAdvancedTuningPanel();
-  setGuideChip(`🎛 Tuning: ${getActiveCameraTuningProfile()}`, 'guide');
-  if (settingsAppliedFromServer) scheduleUserSettingsSync();
-  toast('Advanced tuning reset');
-}
-
-function maybeAutoStartScanner(reason = 'auto') {
-  if (autoScanStartPref !== '1') return;
-  if (isScanning || !appBootstrapped || !isUserAuthenticated) return;
-  if (photoProcessing || photoSendPending || ocrAwaitingServer) return;
-  if (document.visibilityState === 'hidden') return;
-  if (typeof Html5Qrcode === 'undefined') return;
-  if (!isSecureCameraContext()) return;
-  setTimeout(() => {
-    if (isScanning || !isUserAuthenticated || autoScanStartPref !== '1') return;
-    startScanner();
-  }, reason === 'connect' ? 220 : 120);
-}
-
-function startImportLive() {
-  setFunctionMode('import');
-  if (!isScanning) startScanner();
-  showBanner('Import mode live camera ready. Scan then tap Continue to add.', 'info');
-}
-
-function capturePhotoForImport() {
-  setFunctionMode('import');
-  capturePhoto();
-}
-
-function updateFunctionModeUI() {
-  const invBtn = document.getElementById('funcInventoryBtn');
-  const boxTabBtn = document.getElementById('funcBoxBtn');
-  const impBtn = document.getElementById('funcImportBtn');
-  const queueBox = document.querySelector('.queue-box');
-  const checkBox = document.getElementById('checkBox');
-  const boxContainer = document.getElementById('boxContainer');
-  const modeTitle = document.getElementById('modeTitle');
-  const modeSub = document.getElementById('modeSub');
-  const profileAppleBtn = document.getElementById('profileAppleBtn');
-  const profileDellBtn = document.getElementById('profileDellBtn');
-  const manualInput = document.getElementById('manualInput');
-  const manualSaveBtn = document.getElementById('manualSaveBtn');
-  const photoBtn = document.getElementById('photoBtn');
-  const importActions = document.getElementById('importActions');
-  const autosaveCb = document.getElementById('autosave');
-  const cameraTuningSel = document.getElementById('cameraTuningSel');
-
-  const mode = activeFunction;
-  if (invBtn) invBtn.classList.toggle('active', mode === 'inventory');
-  if (boxTabBtn) boxTabBtn.classList.toggle('active', mode === 'box');
-  if (impBtn) impBtn.classList.toggle('active', mode === 'import');
-  if (profileAppleBtn) profileAppleBtn.classList.toggle('active', serialProfile === 'apple');
-  if (profileDellBtn) profileDellBtn.classList.toggle('active', serialProfile === 'dell');
-
-  if (queueBox) queueBox.classList.toggle('import-mode', mode === 'import');
-  
-  if (checkBox) checkBox.style.display = mode === 'import' ? '' : 'none';
-  if (boxContainer) boxContainer.style.display = mode === 'import' ? 'none' : '';
-  if (importActions) importActions.style.display = mode === 'import' ? 'flex' : 'none';
-
-  if (modeTitle) {
-    if (mode === 'inventory') modeTitle.textContent = 'Mode: Check Inventory';
-    else if (mode === 'box') modeTitle.textContent = 'Mode: Box Counting';
-    else modeTitle.textContent = 'Mode: Import check.csv';
-  }
-  
-  if (modeSub) {
-    const profileLabel = serialProfile === 'dell' ? 'Dell Service Tag' : 'Apple Serial';
-    if (mode === 'inventory') modeSub.textContent = `Scan ${profileLabel} values, check against checklist, and save to selected box.`;
-    else if (mode === 'box') modeSub.textContent = `Scan ${profileLabel} values into a specific box. Track missing vs counted.`;
-    else modeSub.textContent = `Add ${profileLabel} values to the global check.csv list.`;
-  }
-  
-  if (manualInput) {
-    const tokenLabel = serialProfile === 'dell' ? 'service tag' : 'serial';
-    manualInput.placeholder = mode === 'inventory' ? `Type ${tokenLabel}…` : (mode === 'box' ? `Type ${tokenLabel} for box…` : `Type ${tokenLabel} to import…`);
-  }
-  if (manualSaveBtn) {
-    manualSaveBtn.textContent = mode === 'inventory' ? 'Save' : (mode === 'box' ? 'Check-in' : 'Add');
-  }
-  if (photoBtn) {
-    const label = mode === 'inventory' ? 'Capture photo' : 'Capture scan';
-    photoBtn.title = label;
-    photoBtn.setAttribute('aria-label', label);
-  }
-  if (autosaveCb) {
-    autosaveCb.disabled = mode !== 'inventory';
-    if (mode === 'inventory') autosaveCb.checked = autosavePref !== '0';
-  }
-  const autoScanCb = document.getElementById('autoScanStart');
-  if (autoScanCb) autoScanCb.checked = autoScanStartPref !== '0';
-  if (cameraTuningSel) cameraTuningSel.value = normalizeCameraTuningProfile(cameraTuningProfile);
-  renderAdvancedTuningPanel();
-  
-  if (mode !== 'import') {
-    if (sock) sock.emit('get_boxes');
-  }
-  updateModePill();
-  updateCaptureControls();
-  maybeAutoStartScanner('mode');
-}
-
-function renderQueue() {
-  const countEl = document.getElementById('qCount');
-  const currentEl = document.getElementById('qCurrent');
-  const listEl = document.getElementById('qList');
-  const laneSel = document.getElementById('laneSel');
-  const laneAutoAssignEl = document.getElementById('laneAutoAssign');
-  if (!countEl || !currentEl || !listEl || !laneSel) return;
-  if (laneAutoAssignEl) laneAutoAssignEl.checked = laneAutoAssign;
-
-  countEl.textContent = sharedLanes.length;
-  if (!sharedLanes.length) {
-    laneSel.innerHTML = '';
-    currentEl.textContent = 'No lane available';
-    listEl.innerHTML = '';
-    return;
-  }
-
-  laneSel.innerHTML = sharedLanes.map((lane) => (
-    `<option value="${esc(lane.name)}">${esc(lane.name)} • q:${lane.count || 0} • s:${lane.scanned_count || 0}</option>`
-  )).join('');
-  if (!sharedLanes.some((lane) => lane.name === selectedLane)) {
-    selectedLane = sharedLanes[0].name;
-    localStorage.setItem('nab_selected_lane', selectedLane);
-  }
-  laneSel.value = selectedLane;
-  const lane = sharedLanes.find((x) => x.name === selectedLane) || sharedLanes[0];
-
-  if (!lane || !lane.current) {
-    currentEl.textContent = `Lane ${selectedLane}: no current item • scanned ${lane ? (lane.scanned_count || 0) : 0}`;
-    listEl.innerHTML = '';
-    return;
-  }
-
-  currentEl.textContent = `${lane.current.serial} • ${lane.current.user || 'anon'} • lane ${lane.name} • scanned ${lane.scanned_count || 0}`;
-  listEl.innerHTML = (lane.items || []).slice(-6).reverse().map((q) => (
-    `<div class="queue-item"><span>${esc(q.serial)}</span><span>${esc(q.updated_at || q.created_at || '')}</span></div>`
-  )).join('');
-}
-
-function onLaneChange() {
-  const laneSel = document.getElementById('laneSel');
-  if (!laneSel) return;
-  selectedLane = laneSel.value || 'General';
-  localStorage.setItem('nab_selected_lane', selectedLane);
-  renderQueue();
-  renderFeed();
-}
-
-function onLaneAutoAssignChange() {
-  const cb = document.getElementById('laneAutoAssign');
-  laneAutoAssign = !!(cb && cb.checked);
-  localStorage.setItem('nab_lane_auto_assign', laneAutoAssign ? '1' : '0');
-}
-
-function createLane() {
-  if (!sock) return;
-  const input = document.getElementById('laneInput');
-  if (!input) return;
-  const lane = (input.value || '').trim();
-  if (!lane) return;
-  selectedLane = lane;
-  localStorage.setItem('nab_selected_lane', selectedLane);
-  sock.emit('lane_create', { lane });
-  input.value = '';
-  renderFeed();
-}
-
-function showUnifiedAuth() {
-  document.getElementById('unifiedAuthModal').style.display = 'grid';
-  showAuthStep1();
-}
-
-function showAuthStep1() {
-  document.getElementById('authStep1').style.display = '';
-  document.getElementById('authStep2').style.display = 'none';
-  const err = document.getElementById('authError');
-  if (err) err.style.display = 'none';
-  const input = document.getElementById('unifiedPinInput');
-  if (input) { input.value = ''; setTimeout(() => input.focus(), 100); }
-}
-
-function showAuthStep2() {
-  document.getElementById('authStep1').style.display = 'none';
-  document.getElementById('authStep2').style.display = '';
-  const err = document.getElementById('regError');
-  if (err) err.style.display = 'none';
-  setTimeout(() => document.getElementById('nameInput').focus(), 100);
-}
-
-function showAuthError(msg) {
-  const el = document.getElementById('authError');
-  if (!el) return;
-  el.textContent = msg;
-  el.style.display = 'block';
-  const input = document.getElementById('unifiedPinInput');
-  if (input) { input.value = ''; input.focus(); }
-}
-
-function showRegError(msg) {
-  const el = document.getElementById('regError');
-  if (!el) return;
-  el.textContent = msg;
-  el.style.display = 'block';
-}
-
-function hideUnifiedAuth() {
-  document.getElementById('unifiedAuthModal').style.display = 'none';
-}
-
-// Unified PIN submission: enter PIN → server decides what to do
-function submitUnifiedPin() {
-  const input = document.getElementById('unifiedPinInput');
-  const pin = (input.value || '').trim();
-  if (!pin) {
-    showAuthError('Enter your PIN');
-    return;
-  }
-  // Clear ALL cached credentials so the entered PIN is the sole credential
-  clearSessionTokenCache();
-  clearJoinPinCache();
-  isUserAuthenticated = false;
-  appBootstrapped = false;
-  // Save entered PIN as the join pin
-  saveJoinPin(pin);
-  // Always disconnect and reconnect fresh with just this PIN
-  resetSocketClient();
-  bootstrapApp();
-}
-
-// Legacy compatibility wrappers
-function showPinModal() { showUnifiedAuth(); }
-function submitPin() { submitUnifiedPin(); }
-
-function updatePerfNote(data) {
-  if (!data) return;
-  const mode = document.getElementById('perfMode');
-  const load = document.getElementById('perfLoad');
-  if (typeof data.next_delay_ms === 'number') {
-    ocrDelayMs = data.next_delay_ms;
-  }
-  const status = data.status || 'ready';
-  const label = {
-    ready: 'Smart OCR ready',
-    accepted: 'Frame accepted',
-    server_busy: 'Queue balancing active',
-    client_pending: 'Waiting on prior frame',
-    no_text: 'Reading label…',
-    no_match: 'Looking for serial…',
-    low_confidence: 'Low confidence, rescanning…',
-    idle: 'Smart OCR session idle',
-    error: 'OCR retrying…',
-    empty: 'Frame dropped'
-  }[status] || 'Smart OCR active';
-  const confText = typeof data.ocr_confidence === 'number'
-    ? ` • conf ${Math.round(data.ocr_confidence * 100)}%`
-    : '';
-  mode.textContent = `${label}${confText} • next ${ocrDelayMs}ms`;
-  load.textContent = `M4 OCR pool ${data.inflight || 0}/${data.capacity || 0} • ${data.active_scanners || 0} users • ${data.priority_scanners || 0} priority`;
-}
-
-function renderOcrDashboard(data) {
-  if (!data) return;
-  const active = data.active_scanners || 0;
-  const inflight = data.inflight || 0;
-  const capacity = data.capacity || 0;
-  const matchRate = data.match_rate || 0;
-  const confidencePct = data.avg_confidence_pct || 0;
-  const utilization = capacity > 0 ? Math.min(100, Math.round((inflight / capacity) * 100)) : 0;
-
-  document.getElementById('mActive').textContent = active;
-  document.getElementById('mPool').textContent = `${inflight}/${capacity}`;
-  document.getElementById('mLatency').textContent = `${data.avg_latency_ms || 0}ms`;
-  document.getElementById('mMatch').textContent = `${confidencePct}%`;
-  document.getElementById('mUtilText').textContent = `${utilization}%`;
-  document.getElementById('mHitText').textContent = `${confidencePct}%`;
-  document.getElementById('mUtilFill').style.width = `${utilization}%`;
-  document.getElementById('mHitFill').style.width = `${confidencePct}%`;
-
-  const status = document.getElementById('mStatus');
-  if (!active) {
-    status.className = 'status-pill status-idle';
-    status.textContent = 'Idle';
-  } else if (inflight >= capacity && capacity > 0) {
-    status.className = 'status-pill status-busy';
-    status.textContent = 'High Load';
-  } else {
-    status.className = 'status-pill status-active';
-    status.textContent = 'Active';
-  }
-
-  const note = document.getElementById('mNote');
-  const sessions = active;
-  const priority = data.priority_scanners || 0;
-  const users = data.connected_users || 0;
-  const delay = data.recommended_delay_ms || 0;
-  const frames = data.frames_accepted || 0;
-  const matches = data.matches || 0;
-  if (!users) {
-    note.textContent = 'No live sessions connected.';
-  } else if (!sessions) {
-    note.textContent = `${users} live session${users === 1 ? '' : 's'} connected. Waiting for a scanner to start.`;
-  } else {
-    note.textContent = `${sessions} scanning, OCR ${confidencePct}% avg (min ${data.min_confidence_pct || 0}%), ${matches}/${frames} matches, pacing ${delay}ms.`;
-  }
-}
-
-function drawOcrCropToCanvas(video, canvas, opts = {}) {
-  const sourceWidth = video.videoWidth;
-  const sourceHeight = video.videoHeight;
-  const widthRatio = opts.widthRatio || 0.94;
-  const heightRatio = opts.heightRatio || 0.32;
-  const centerY = opts.centerY || 0.57;
-  const qualityWidth = opts.qualityWidth || 1400;
-  const adaptiveCenter = opts.adaptiveCenter !== false;
-
-  const cropWidth = Math.floor(sourceWidth * widthRatio);
-  const cropHeight = Math.floor(sourceHeight * heightRatio);
-  const cropX = Math.floor((sourceWidth - cropWidth) / 2);
-  const cropY = Math.max(0, Math.floor(sourceHeight * centerY - cropHeight / 2));
-  const scale = Math.min(1, qualityWidth / cropWidth);
-
-  const outW = Math.max(1, Math.floor(cropWidth * scale));
-  const outH = Math.max(1, Math.floor(cropHeight * scale));
-  canvas.width = outW;
-  canvas.height = outH;
-
-  const temp = document.createElement('canvas');
-  temp.width = outW;
-  temp.height = outH;
-  const tctx = temp.getContext('2d', { willReadFrequently: true });
-  tctx.drawImage(
-    video,
-    cropX, cropY, cropWidth, cropHeight,
-    0, 0, outW, outH
-  );
-
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
-
-  // Auto-center serial text vertically within the crop band.
-  if (adaptiveCenter && outH >= 48 && outW >= 160) {
-    try {
-      const img = tctx.getImageData(0, 0, outW, outH);
-      const data = img.data;
-      const rowScore = new Float32Array(outH);
-      const colScore = new Float32Array(outW);
-      for (let y = 0; y < outH - 1; y++) {
-        let score = 0;
-        for (let x = 0; x < outW - 1; x += 2) {
-          const i = (y * outW + x) * 4;
-          const j = ((y + 1) * outW + x) * 4;
-          const k = (y * outW + (x + 1)) * 4;
-          const r = data[i], g = data[i + 1], b = data[i + 2];
-          const r2 = data[j], g2 = data[j + 1], b2 = data[j + 2];
-          const rx = data[k], gx = data[k + 1], bx = data[k + 2];
-          const l1 = 0.299 * r + 0.587 * g + 0.114 * b;
-          const l2 = 0.299 * r2 + 0.587 * g2 + 0.114 * b2;
-          const lx = 0.299 * rx + 0.587 * gx + 0.114 * bx;
-          score += Math.abs(l1 - l2);
-          colScore[x] += Math.abs(l1 - lx);
-        }
-        rowScore[y] = score;
-      }
-      // Smooth scores to avoid noisy spikes.
-      const smooth = new Float32Array(outH);
-      for (let y = 2; y < outH - 2; y++) {
-        smooth[y] = rowScore[y - 2] * 0.12 + rowScore[y - 1] * 0.2 + rowScore[y] * 0.36 + rowScore[y + 1] * 0.2 + rowScore[y + 2] * 0.12;
-      }
-      let bestY = Math.floor(outH / 2);
-      let best = -1;
-      for (let y = Math.floor(outH * 0.12); y < Math.floor(outH * 0.88); y++) {
-        if (smooth[y] > best) {
-          best = smooth[y];
-          bestY = y;
-        }
-      }
-      let bestX = Math.floor(outW / 2);
-      let bestCol = -1;
-      for (let x = Math.floor(outW * 0.12); x < Math.floor(outW * 0.88); x++) {
-        if (colScore[x] > bestCol) {
-          bestCol = colScore[x];
-          bestX = x;
-        }
-      }
-      const bandH = Math.max(Math.floor(outH * 0.62), 56);
-      const bandW = Math.max(Math.floor(outW * 0.88), 180);
-      const top = Math.max(0, Math.min(outH - bandH, Math.floor(bestY - bandH / 2)));
-      const left = Math.max(0, Math.min(outW - bandW, Math.floor(bestX - bandW / 2)));
-      ctx.drawImage(temp, left, top, bandW, bandH, 0, 0, outW, outH);
-    } catch (e) {
-      ctx.drawImage(temp, 0, 0, outW, outH);
-    }
-  } else {
-    ctx.drawImage(temp, 0, 0, outW, outH);
-  }
-
-  // Aggressive filters for metallic MacBook surfaces.
-  ctx.filter = 'grayscale(1) contrast(1.9) brightness(1.08) saturate(0)';
-  ctx.drawImage(canvas, 0, 0);
-
-  // Adaptive thresholding emulation via high-contrast passes.
-  ctx.filter = 'contrast(2.5) brightness(0.92)';
-  ctx.drawImage(canvas, 0, 0);
-  ctx.filter = 'contrast(1.6) brightness(1.02)';
-  ctx.drawImage(canvas, 0, 0);
-  ctx.filter = 'none';
-}
-
-function evaluateFrameQuality(canvas) {
-  const tune = getCameraTuningConfig();
-  const minLight = typeof tune.minLight === 'number' ? tune.minLight : 45;
-  const minEdge = typeof tune.minEdge === 'number' ? tune.minEdge : 0.042;
-  const minVariance = typeof tune.minVariance === 'number' ? tune.minVariance : 170;
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  if (!ctx) return { ok: false, reason: 'camera_read_fail' };
-  const w = canvas.width || 0;
-  const h = canvas.height || 0;
-  if (w < 60 || h < 24) return { ok: false, reason: 'frame_too_small' };
-  let img;
-  try {
-    img = ctx.getImageData(0, 0, w, h);
-  } catch (_e) {
-    return { ok: false, reason: 'camera_read_fail' };
-  }
-  const data = img.data;
-  const step = Math.max(2, Math.floor(Math.min(w, h) / 180));
-  let sum = 0;
-  let sum2 = 0;
-  let edgeHits = 0;
-  let samples = 0;
-  for (let y = 0; y < h - step; y += step) {
-    for (let x = 0; x < w - step; x += step) {
-      const i = (y * w + x) * 4;
-      const ir = (y * w + (x + step)) * 4;
-      const ib = ((y + step) * w + x) * 4;
-      const l = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
-      const lr = 0.299 * data[ir] + 0.587 * data[ir + 1] + 0.114 * data[ir + 2];
-      const lb = 0.299 * data[ib] + 0.587 * data[ib + 1] + 0.114 * data[ib + 2];
-      const grad = Math.abs(l - lr) + Math.abs(l - lb);
-      if (grad > 42) edgeHits += 1;
-      sum += l;
-      sum2 += l * l;
-      samples += 1;
-    }
-  }
-  if (!samples) return { ok: false, reason: 'frame_empty' };
-  const mean = sum / samples;
-  const variance = Math.max(0, (sum2 / samples) - (mean * mean));
-  const edgeDensity = edgeHits / samples;
-
-  if (mean < minLight) return { ok: false, reason: 'too_dark', mean, variance, edgeDensity };
-  if (edgeDensity < minEdge) return { ok: false, reason: 'no_label', mean, variance, edgeDensity };
-  if (variance < minVariance) return { ok: false, reason: 'too_blurry', mean, variance, edgeDensity };
-  return { ok: true, mean, variance, edgeDensity };
-}
-
-function frameQualityHint(result) {
-  const reason = (result && result.reason) || '';
-  if (reason === 'too_dark') return { text: '💡 Increase light on label', level: 'warn' };
-  if (reason === 'too_blurry') return { text: '🎯 Hold steady, refocusing', level: 'warn' };
-  if (reason === 'no_label') return { text: '📦 Center serial label in frame', level: 'warn' };
-  if (reason === 'camera_read_fail') return { text: '📷 Camera stream unstable', level: 'warn' };
-  return { text: '✅ Label looks good', level: 'ok' };
-}
-
-function frameQualityScore(result) {
-  if (!result || !result.ok) return 0;
-  const variance = Math.min(1, Math.max(0, (result.variance || 0) / 520));
-  const edge = Math.min(1, Math.max(0, (result.edgeDensity || 0) / 0.12));
-  const light = Math.min(1, Math.max(0, ((result.mean || 0) - 48) / 110));
-  return (variance * 0.45) + (edge * 0.4) + (light * 0.15);
-}
-
-function getUserColor(name) {
-  if (!userColors[name]) {
-    userColors[name] = colorPalette[colorIdx % colorPalette.length];
-    colorIdx++;
-  }
-  return userColors[name];
-}
-
-if (!clientId) {
-  clientId = (crypto && crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2));
-  localStorage.setItem('nab_scanner_client_id', clientId);
-}
-
-// ============================================
-// Audio
-// ============================================
-const AudioCtx = window.AudioContext || window.webkitAudioContext;
-let audioCtx = null;
-function playTone(freq = 1200, gainValue = 0.08, durationSec = 0.14) {
-  if (!audioCtx) audioCtx = new AudioCtx();
-  const o = audioCtx.createOscillator();
-  const g = audioCtx.createGain();
-  o.connect(g); g.connect(audioCtx.destination);
-  o.frequency.value = freq; g.gain.value = gainValue;
-  o.start();
-  g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + durationSec);
-  o.stop(audioCtx.currentTime + durationSec);
-}
-function canPlayFeedback(minGapMs = 500) {
-  if (document.hidden) return false;
-  const now = Date.now();
-  if ((now - lastAudioAt) < minGapMs) return false;
-  lastAudioAt = now;
-  return true;
-}
-function beep(freq = 1200) {
-  if (!canPlayFeedback(420)) return;
-  playTone(freq, 0.07, 0.13);
-}
-function beepDupe() {
-  if (!canPlayFeedback(850)) return;
-  playTone(420, 0.055, 0.12);
-  setTimeout(() => playTone(330, 0.045, 0.11), 130);
-}
-
-// ============================================
-// Socket.IO
-// ============================================
-function initSocket() {
-  if (typeof io === 'undefined') {
-    ensureSocketIoClientLoaded();
-    return false;
-  }
-  if (sock) return true;
-  sock = io({
-    transports: ['websocket', 'polling'],
-    reconnection: true,
-    reconnectionAttempts: Infinity,
-    reconnectionDelay: 800,
-    reconnectionDelayMax: 4000,
-    timeout: 10000,
-    auth: {
-      client_id: clientId,
-      name: userName || 'Anonymous',
-      pin: joinPin || '',
-      session_token: sessionToken || '',
-      serial_profile: serialProfile
-    }
-  });
-  syncSocketAuthPayload();
-
-  sock.on('auth_result', (data) => {
-    if (!data) return;
-    if (data.success && data.type === 'session') {
-      // Join PIN accepted — session verified, show user registration
-      showAuthStep2();
-      return;
-    }
-    if (data.success && data.type === 'user') {
-      // User PIN matched — login complete
-      userName = (data.user && data.user.name) || 'Anonymous';
-      isUserAuthenticated = true;
-      localStorage.setItem('nab_scanner_name', userName);
-      if (data.session_token) saveSessionToken(data.session_token);
-      if (data.settings) applyServerSettings(data.settings, { skipToast: true });
-      document.getElementById('userPill').innerHTML = '👤 ' + esc(userName);
-      setAuthPill('ok');
-      setSettingsPill('ok');
-      hideAllIdentityModals();
-      updateCaptureControls();
-      maybeAutoStartScanner('auth');
-      toast('✅ Welcome back, ' + userName);
-      return;
-    }
-    if (!data.success) {
-      showUnifiedAuth();
-      showAuthError(data.reason === 'rate_limit' ? 'Too many attempts. Wait 1 minute.' : 'Invalid PIN. Try again.');
-    }
-  });
-
-  sock.on('identity_status', (data) => {
-    if (!data || !data.verified) {
-      showUnifiedAuth();
-      return;
-    }
-    userName = data.name || 'Anonymous';
-    isUserAuthenticated = !!(data && data.authenticated_user);
-    if (data.client_id) {
-      clientId = data.client_id;
-      localStorage.setItem('nab_scanner_client_id', clientId);
-    }
-    if (data && data.session_token) saveSessionToken(data.session_token);
-    localStorage.setItem('nab_scanner_name', userName);
-    document.getElementById('userPill').innerHTML = '👤 ' + esc(userName);
-    if (data && data.settings) {
-      applyServerSettings(data.settings, { skipToast: true });
-    }
-    setAuthPill(isUserAuthenticated ? 'ok' : 'session');
-    setSettingsPill('ok');
-    updateCaptureControls();
-    if (isUserAuthenticated) {
-      maybeAutoStartScanner('identity');
-      hideAllIdentityModals();
-    } else {
-      // Connected but no user profile → show registration step
-      showAuthStep2();
-    }
-  });
-
-  sock.on('session_status', (data) => {
-    const verified = !!(data && data.verified);
-    isUserAuthenticated = !!(data && data.authenticated_user);
-    if (data && data.session_token) saveSessionToken(data.session_token);
-    if (!verified) {
-      clearOcrAwaitState();
-      if (isScanning) stopScanner();
-      setAuthPill('required');
-      showUnifiedAuth();
-      updateCaptureControls();
-      return;
-    }
-    if (!isUserAuthenticated) {
-      clearOcrAwaitState();
-      if (isScanning) stopScanner();
-      setAuthPill('session');
-      showAuthStep2();
-      updateCaptureControls();
-      return;
-    }
-    setAuthPill('ok');
-    hideAllIdentityModals();
-    sock.emit('scanner_state', { scanning: !!isScanning, serial_profile: serialProfile });
-    sock.emit('load_user_settings');
-    sock.emit('get_boxes');
-    flushPendingSocketEmits();
-    updateCaptureControls();
-    maybeAutoStartScanner('session');
-  });
-
-  sock.on('user_settings', (data) => {
-    if (!data || !data.ok) {
-      setSettingsPill('warn');
-      return;
-    }
-    applyServerSettings(data.settings || {}, { skipToast: true });
-    setSettingsPill('ok');
-  });
-
-  sock.on('auth_error', (data) => {
-    const reason = data && data.reason ? data.reason : 'auth_error';
-    if (reason === 'not_verified') {
-      clearOcrAwaitState();
-      if (isScanning) stopScanner();
-      showUnifiedAuth();
-      showAuthError('Session expired. Enter PIN again.');
-      return;
-    }
-    if (reason === 'invalid_pin') {
-      showUnifiedAuth();
-      showAuthError('Invalid PIN. Try again.');
-      return;
-    }
-    if (reason === 'pin_in_use') {
-      showAuthStep2();
-      showRegError('PIN already in use. Choose a different personal PIN.');
-      return;
-    }
-    if (reason === 'missing_fields') {
-      showAuthStep2();
-      showRegError('Name and PIN are required.');
-      return;
-    }
-    if (reason === 'rate_limit') {
-      showUnifiedAuth();
-      showAuthError('Too many attempts. Wait 1 minute.');
-      return;
-    }
-    if (reason === 'user_auth_required') {
-      clearOcrAwaitState();
-      if (isScanning) stopScanner();
-      setAuthPill('session');
-      showUnifiedAuth();
-      return;
-    }
-    showUnifiedAuth();
-    showAuthError('Authentication failed. Try again.');
-  });
-
-  sock.on('profile_updated', (data) => {
-    if (data.success) {
-      toast('✅ Profile updated');
-      closeProfile();
-    }
-  });
-
-  sock.on('bulk_import_result', (data) => {
-    toast(`✅ Imported ${data.added}/${data.total} serials`);
-    if (data.errors && data.errors.length > 0) {
-      console.warn('Import errors:', data.errors);
-    }
-    loadCheckset();
-  });
-
-  sock.on('connect', () => {
-    const connPill = document.getElementById('connPill');
-    if (connPill) {
-      connPill.style.background = 'var(--success-bg)';
-      connPill.style.color = 'var(--success)';
-    }
-    sock.emit('session_heartbeat');
-    sock.emit('get_session_status');
-    if (isScanning) queueNextOcr(140);
-    if (isUserAuthenticated) flushPendingSocketEmits();
-    updateCaptureControls();
-    maybeAutoStartScanner('connect');
-  });
-
-  sock.on('connect_error', (err) => {
-    const connPill = document.getElementById('connPill');
-    if (connPill) {
-      connPill.style.background = 'var(--warning-bg)';
-      connPill.style.color = 'var(--warning)';
-    }
-    appBootstrapped = false;
-    const msg = String((err && (err.message || err.data || '')) || '').toLowerCase();
-    const invalidPin = msg.includes('unauthorized') || msg.includes('not authorized') || msg.includes('auth');
-    if (invalidPin) {
-      resetSocketClient();
-      clearJoinPinCache();
-      clearSessionTokenCache();
-      showUnifiedAuth();
-      showAuthError('Invalid PIN. Try again.');
-      return;
-    }
-    if (!joinPin && !sessionToken) {
-      showUnifiedAuth();
-      return;
-    }
-    setSettingsPill('warn');
-    const now = Date.now();
-    if ((now - lastConnectErrorToastAt) > 6000) {
-      toast('Connection lost. Retrying…');
-      lastConnectErrorToastAt = now;
-    }
-  });
-
-  sock.on('disconnect', () => {
-    const connPill = document.getElementById('connPill');
-    if (connPill) {
-      connPill.style.background = 'var(--danger-bg)';
-      connPill.style.color = 'var(--danger)';
-    }
-    clearOcrAwaitState();
-    setAuthPill((joinPin || sessionToken) ? 'session' : 'required');
-    setSettingsPill('warn');
-    updateCaptureControls();
-  });
-
-  sock.on('logged_out', () => {
-    clearSessionTokenCache();
-    clearOcrAwaitState();
-    setAuthPill('required');
-    setSettingsPill('warn');
-    updateCaptureControls();
-  });
-
-  sock.on('boxes_updated', (data) => {
-    allBoxes = (data && typeof data === 'object') ? data : {};
-    if (Object.keys(allBoxes).length > 0) autoBoxCreatePending = false;
-    if (selectedBoxId && !allBoxes[selectedBoxId]) saveSelectedBox('');
-    if (!selectedBoxId) {
-      const joined = Object.values(allBoxes).find((b) => b && b.joined);
-      if (joined && joined.id) saveSelectedBox(joined.id);
-      else {
-        const firstId = Object.keys(allBoxes)[0] || '';
-        if (firstId) saveSelectedBox(firstId);
-      }
-    }
-    if (pendingBoxJoinId && allBoxes[pendingBoxJoinId] && allBoxes[pendingBoxJoinId].joined) {
-      pendingBoxJoinId = '';
-    }
-    renderBoxes();
-    renderFeed();
-  });
-
-  sock.on('box_joined', (data) => {
-    if (!data || !data.ok) {
-      showBanner('Cannot join box right now.', 'warning');
-      return;
-    }
-    autoBoxCreatePending = false;
-    pendingBoxJoinId = '';
-    saveSelectedBox(data.box_id || '');
-    renderBoxes();
-    renderFeed();
-  });
-
-  sock.on('box_scan_update', (data) => {
-    if (!data || !data.box_id) return;
-    if (data.box_id === selectedBoxId && data.in_target) {
-      flashFoundSerial(data.serial);
-    }
-  });
-
-  sock.on('box_rejected', (data) => {
-    const reason = data && data.reason ? data.reason : 'error';
-    if (reason === 'box_closed') {
-      showBanner('This box is closed. Reopen it to continue scanning.', 'warning');
-      return;
-    }
-    if (reason === 'box_not_found') {
-      showBanner('Selected box was removed.', 'warning');
-      return;
-    }
-    showBanner('Box action rejected.', 'warning');
-  });
-
-  sock.on('qr_code_data', (data) => {
-    qrRequestInFlight = false;
-    if (qrRequestTimer) {
-      clearTimeout(qrRequestTimer);
-      qrRequestTimer = null;
-    }
-    applyQrData(data || {});
-  });
-
-  sock.on('qr_code_error', (data) => {
-    qrRequestInFlight = false;
-    if (qrRequestTimer) {
-      clearTimeout(qrRequestTimer);
-      qrRequestTimer = null;
-    }
-    const message = (data && data.reason) ? String(data.reason) : 'Failed to load QR';
-    showQrError(message);
-  });
-
-  // Real-time scan from any user
-  sock.on('new_scan', (data) => {
-    scanHistory.unshift(data);
-    renderFeed();
-    updateStats();
-    if (data && data.box_id && data.box_id === selectedBoxId && data.box_in_target) {
-      flashFoundSerial(data.serial);
-    }
-
-    // Flash + sound if from another user
-    if (data.user !== userName) {
-      flash('info');
-      beep(800);
-    }
-  });
-
-  sock.on('ocr_success', (data) => {
-    if (!data || !data.serial) return;
-    latestOcrSerial = data.serial;
-    latestOcrAt = Date.now();
-    latestOcrConfidence = typeof data.ocr_confidence === 'number' ? data.ocr_confidence : latestOcrConfidence;
-    latestOcrCropImage = lastSubmittedCropImage || latestOcrCropImage || '';
-    setPhotoSendPending(false);
-    clearOcrAwaitState();
-    if (data.source === 'photo' && !isScanning) stopPhotoOnlyStream();
-    if (typeof data.next_delay_ms === 'number') ocrDelayMs = data.next_delay_ms;
-    updateLiveCaptureTuning('accepted');
-    setGuideChip('✅ Serial detected', 'ok');
-    updatePerfNote({ status: 'accepted', ...data, accepted: true });
-    onScan(data.serial, { confidence: latestOcrConfidence, source: 'ocr', cropImage: latestOcrCropImage });
-    queueNextOcr();
-  });
-
-  sock.on('ocr_policy', (data) => {
-    setPhotoSendPending(false);
-    clearOcrAwaitState();
-    updateLiveCaptureTuning(data && data.status);
-    if (data && data.status === 'low_confidence') setGuideChip('🎯 Low confidence, hold steady', 'warn');
-    if (data && data.status === 'no_text') setGuideChip('📦 Move label into center box', 'warn');
-    if (data && data.status === 'no_match') setGuideChip('🔎 Label seen, refining serial', 'guide');
-    if (data && data.status === 'server_busy') setGuideChip('⏳ OCR queue busy, pacing scan', 'guide');
-    if (data && data.status === 'low_confidence') {
-      maybeAutoRefocusByConfidence(data.ocr_confidence);
-    }
-    if (data && data.source === 'photo') {
-      if (!isScanning) stopPhotoOnlyStream();
-      if (data.status === 'no_match' || data.status === 'no_text') {
-        showBanner('📸 Photo uploaded but no serial found', 'warning');
-      } else if (data.status === 'low_confidence') {
-        const conf = typeof data.ocr_confidence === 'number' ? Math.round(data.ocr_confidence * 100) : 0;
-        showBanner(`📸 Low OCR confidence ${conf}%, please rescan`, 'warning');
-      } else if (data.status === 'error') {
-        showBanner('⚠️ Photo processing failed', 'warning');
-      }
-    }
-    updatePerfNote(data);
-    queueNextOcr();
-  });
-
-  sock.on('save_rejected', (data) => {
-    if (data && data.reason === 'non_apple_serial') {
-      showBanner('Invalid Apple serial format (expect 10 or 12 chars).', 'warning');
-      return;
-    }
-    if (data && data.reason === 'non_dell_serial') {
-      showBanner('Invalid Dell Service Tag format (expect 7 chars).', 'warning');
-      return;
-    }
-    if (data && data.reason === 'not_in_checklist') {
-      showBanner('Serial not found in check.csv. Not added to list.', 'warning');
-      return;
-    }
-    if (data && data.reason === 'box_closed') {
-      showBanner('Box is closed. Reopen to add new scans.', 'warning');
-      return;
-    }
-    if (data && data.reason === 'box_not_found') {
-      showBanner('Box not found. Please reselect a box.', 'warning');
-      return;
-    }
-    showBanner('Invalid serial number.', 'warning');
-  });
-
-  sock.on('lanes_data', (data) => {
-    sharedLanes = Array.isArray(data) ? data : [];
-    renderQueue();
-  });
-
-  sock.on('queue_data', (data) => {
-    sharedLanes = Array.isArray(data) ? data : [];
-    renderQueue();
-  });
-
-  sock.on('queue_rejected', (data) => {
-    const reason = data && data.reason ? data.reason : 'invalid';
-    if (reason === 'no_current_queue') {
-      showBanner('No current queue item. Use Add Queue first.', 'warning');
-      return;
-    }
-    if (reason === 'invalid_lane') {
-      showBanner('Invalid lane name.', 'warning');
-      return;
-    }
-    if (reason === 'non_apple_serial') {
-      showBanner('Queue expects Apple serial format.', 'warning');
-      return;
-    }
-    if (reason === 'non_dell_serial') {
-      showBanner('Queue expects Dell Service Tag format.', 'warning');
-      return;
-    }
-    showBanner('Queue update rejected.', 'warning');
-  });
-
-  sock.on('checklist_update', (data) => {
-    const status = data && data.status ? data.status : 'invalid';
-    if (status === 'added') {
-      showBanner('Added to check.csv', 'success');
-      loadCheckset();
-      return;
-    }
-    if (status === 'already_exists') {
-      showBanner('Already exists in check.csv', 'info');
-      return;
-    }
-    if (status === 'non_apple_serial') {
-      showBanner('Invalid Apple serial (expect 10 or 12 chars)', 'warning');
-      return;
-    }
-    if (status === 'non_dell_serial') {
-      showBanner('Invalid Dell Service Tag (expect 7 chars)', 'warning');
-      return;
-    }
-    if (status === 'not_approved') {
-      showBanner('Approve checkbox required before add', 'warning');
-      return;
-    }
-    if (status === 'low_confidence') {
-      showBanner('Need confidence > 99% to add', 'warning');
-      return;
-    }
-    showBanner('Cannot add to check.csv', 'warning');
-  });
-
-  sock.on('checklist_changed', () => {
-    loadCheckset();
-  });
-
-  sock.on('ocr_dashboard', (data) => {
-    renderOcrDashboard(data);
-  });
-
-  sock.on('session_registered', (data) => {
-    currentSessionId = data && data.sid ? data.sid : '';
-  });
-
-  // User list updates
-  sock.on('users_update', (users) => {
-    renderUsers(users);
-    document.getElementById('connCount').textContent = users.length;
-    document.getElementById('sOnline').textContent = users.length;
-  });
-
-  setInterval(() => {
-    if (sock && sock.connected) sock.emit('session_heartbeat');
-  }, 20000);
-
-  // History load
-  sock.on('history_data', (data) => {
-    scanHistory = data;
-    renderFeed();
-    updateStats();
-  });
-
-  // Entry deleted
-  sock.on('entry_deleted', (data) => {
-    scanHistory = scanHistory.filter(h =>
-      !(h.serial === data.serial && h.timestamp === data.timestamp)
-    );
-    renderFeed();
-    updateStats();
-  });
-
-  // All cleared
-  sock.on('all_cleared', () => {
-    scanHistory = [];
-    renderFeed();
-    updateStats();
-  });
-
-  sock.on('photo_received', () => {
-    setPhotoSendPending(false);
-    setProcessingState('photo', true, 'uploaded, OCR running');
-  });
-}
-
-// ============================================
-// Identity & Profile
-// ============================================
-// Legacy wrappers → all redirect to unified auth modal
-function showNameModal() { showUnifiedAuth(); showAuthStep2(); }
-function showAuthChoiceModal() { showUnifiedAuth(); }
-function showUserPinModal() { showUnifiedAuth(); }
-
-function showProfileModal() {
-  document.getElementById('profNameInput').value = userName;
-  document.getElementById('profPinInput').value = '';
-  document.getElementById('profileModal').style.display = 'grid';
-  setTimeout(() => document.getElementById('profNameInput').focus(), 150);
-}
-
-function closeProfile() {
-  document.getElementById('profileModal').style.display = 'none';
-}
-
-function hideAllIdentityModals() {
-  hideUnifiedAuth();
-  // Also hide legacy stubs
-  document.getElementById('authChoiceModal').style.display = 'none';
-  document.getElementById('nameModal').style.display = 'none';
-  document.getElementById('userPinModal').style.display = 'none';
-  document.getElementById('pinModal').style.display = 'none';
-}
-
-function registerUser() {
-  const name = document.getElementById('nameInput').value.trim();
-  const pin = document.getElementById('regPinInput').value.trim();
-  const pinConfirm = (document.getElementById('regPinConfirmInput')?.value || '').trim();
-  if (!name || !pin || !pinConfirm) {
-    showRegError('Name and PIN are required.');
-    return;
-  }
-  if (pin !== pinConfirm) {
-    showRegError('PIN confirmation does not match.');
-    return;
-  }
-  
-  if (sock) {
-    sock.emit('register_user', { client_id: clientId, name, pin });
-  }
-}
-
-function submitUserPin() {
-  // Legacy compatibility — redirect to unified auth
-  showUnifiedAuth();
-}
-
-function resetIdentity() {
-  if (!confirm('Switch user? This will clear your current identity on this device.')) return;
-  localStorage.removeItem('nab_scanner_name');
-  userName = '';
-  userPin = '';
-  showUnifiedAuth();
-}
-
-function updateProfile() {
-  const name = document.getElementById('profNameInput').value.trim();
-  const pin = document.getElementById('profPinInput').value.trim();
-  if (!name) {
-    toast('Name cannot be empty');
-    return;
-  }
-  
-  const payload = { name };
-  if (pin) {
-    payload.pin = pin;
-    userPin = pin;
-  }
-  
-  if (sock) {
-    sock.emit('update_profile', payload);
-  }
-}
-
-function changeName() {
-  showProfileModal();
-}
-
-// Bulk Import
-function showBulkImport() {
-  document.getElementById('bulkImportInput').value = '';
-  document.getElementById('bulkImportModal').style.display = 'grid';
-  setTimeout(() => document.getElementById('bulkImportInput').focus(), 150);
-}
-
-function closeBulkImport() {
-  document.getElementById('bulkImportModal').style.display = 'none';
-}
-
-function submitBulkImport() {
-  const text = document.getElementById('bulkImportInput').value.trim();
-  if (!text) return;
-  if (!sock) return;
-    sock.emit('bulk_import_checklist', { text, serial_profile: serialProfile });
-  closeBulkImport();
-  toast('Processing bulk import...');
-}
-
-// ============================================
-// OCR (Text Recognition) Backend Relay
-// ============================================
-async function doOcrFrame() {
-  if (!isScanning || !isUserAuthenticated || ocrRunning || !sock || !sock.connected || ocrAwaitingServer || scanHoldActive || document.hidden) return;
-  const video = document.querySelector('#reader video');
-  if (!video || video.readyState < 2) return;
-
-  ocrRunning = true;
-  try {
-    const tune = getCameraTuningConfig();
-    const canvas = document.createElement('canvas');
-    drawOcrCropToCanvas(video, canvas, {
-      widthRatio: tune.widthRatio,
-      heightRatio: tune.heightRatio,
-      centerY: tune.centerY,
-      qualityWidth: Math.max(1000, Math.min(1800, Math.round((tune.qualityWidth || liveCaptureWidth) * (liveCaptureWidth / 1500))))
-    });
-    const quality = evaluateFrameQuality(canvas);
-    if (!quality.ok) {
-      goodFrameStreak = 0;
-      badFrameStreak += 1;
-      const hint = frameQualityHint(quality);
-      setGuideChip(hint.text, hint.level);
-      if (quality.reason === 'too_blurry' || quality.reason === 'no_label' || badFrameStreak >= 3) {
-        refocusCamera(true);
-      }
-      setProcessingState('live', true, hint.text.replace(/^.. /, ''));
-      ocrRunning = false;
-      queueNextOcr(Math.max(180, Math.min(ocrDelayMs, 320)));
-      return;
-    }
-    badFrameStreak = 0;
-    goodFrameStreak += 1;
-    const qualityScore = frameQualityScore(quality);
-    if (goodFrameStreak < 2 && qualityScore < 0.72) {
-      setGuideChip('🎯 Hold steady for stable capture', 'guide');
-      setProcessingState('live', true, 'stabilizing frame');
-      ocrRunning = false;
-      queueNextOcr(Math.max(170, Math.min(ocrDelayMs, 260)));
-      return;
-    }
-    setGuideChip('✅ Label stable', 'ok');
-
-    const b64 = canvas.toDataURL('image/jpeg', liveCaptureQuality);
-    lastSubmittedCropImage = b64;
-    setProcessingState('live', true);
-    ocrAwaitingServer = true;
-    armOcrAwaitTimeout('live');
-    sock.emit('process_ocr_frame', { image: b64, serial_profile: serialProfile });
-  } catch(e) {
-    sock.emit('debug_log', { msg: 'ocr_canvas_error: ' + e.message });
-    setProcessingState('live', false);
-    clearOcrAwaitState();
-  }
-
-  ocrRunning = false;
-}
-
-function stopPhotoOnlyStream() {
-  if (!photoOnlyStream) return;
-  photoOnlyStream.getTracks().forEach(track => track.stop());
-  photoOnlyStream = null;
-}
-
-async function getVideoElementForPhoto() {
-  const activeVideo = document.querySelector('#reader video');
-  if (activeVideo && activeVideo.readyState >= 2) return activeVideo;
-
-  const reader = document.getElementById('reader');
-  reader.innerHTML = '';
-  const video = document.createElement('video');
-  video.setAttribute('playsinline', 'true');
-  video.muted = true;
-  video.autoplay = true;
-  video.style.width = '100%';
-  video.style.borderRadius = '10px';
-  reader.appendChild(video);
-
-  photoOnlyStream = await navigator.mediaDevices.getUserMedia({
-    video: { facingMode: currentFacingMode || 'environment' },
-    audio: false
-  });
-  video.srcObject = photoOnlyStream;
-  await video.play();
-  await new Promise(resolve => setTimeout(resolve, 500));
-  return video;
-}
-
-async function capturePhoto() {
-  if (!isUserAuthenticated) {
-    setAuthPill('session');
-    showAuthChoiceModal();
-    toast('Login required before capture.');
-    return;
-  }
-  if (!sock || !sock.connected || photoProcessing || photoSendPending || ocrAwaitingServer) return;
-
-  try {
-    const video = await getVideoElementForPhoto();
-    if (!video || video.readyState < 2) {
-      toast('⚠️ Camera not ready');
-      return;
-    }
-
-    const tune = getCameraTuningConfig();
-    const canvas = document.createElement('canvas');
-    drawOcrCropToCanvas(video, canvas, {
-      widthRatio: Math.min(0.98, (tune.widthRatio || 0.94) + 0.02),
-      heightRatio: Math.max(0.24, (tune.heightRatio || 0.30) - 0.02),
-      centerY: Math.max(0.5, (tune.centerY || 0.56) - 0.01),
-      qualityWidth: Math.max(1450, (tune.qualityWidth || 1500) + 160)
-    });
-    const quality = evaluateFrameQuality(canvas);
-    if (!quality.ok) {
-      const hint = frameQualityHint(quality);
-      setGuideChip(hint.text, hint.level);
-      if (quality.reason === 'too_blurry' || quality.reason === 'no_label') {
-        refocusCamera(true);
-      }
-      showBanner(hint.text, 'warning');
-      return;
-    }
-    setGuideChip('✅ Label stable', 'ok');
-
-    photoProcessing = true;
-    flash('info');
-    lastSubmittedCropImage = canvas.toDataURL('image/jpeg', 0.82);
-    setPhotoSendPending(true);
-    showBanner('📸 Photo captured, processing on server…', 'info');
-    ocrAwaitingServer = true;
-    armOcrAwaitTimeout('photo');
-    sock.emit('process_photo_capture', { image: lastSubmittedCropImage, serial_profile: serialProfile });
-  } catch (e) {
-    clearOcrAwaitState();
-    toast('⚠️ Photo capture failed');
-  }
-}
-
-function queueNextOcr(delay = ocrDelayMs) {
-  if (ocrTimer) clearTimeout(ocrTimer);
-  if (!isScanning || scanHoldActive || !isUserAuthenticated || !sock || !sock.connected || document.hidden) return;
-  ocrTimer = setTimeout(doOcrFrame, Math.max(150, delay || DEFAULT_OCR_DELAY_MS));
-}
-
-// ============================================
-// Camera
-// ============================================
-let useFacingMode = false;
-let currentFacingMode = 'environment';
-let lastAutoRefocusAt = 0;
-
-function getActiveVideoTrack() {
-  const video = document.querySelector('#reader video');
-  const stream = video && video.srcObject ? video.srcObject : photoOnlyStream;
-  if (!stream || !stream.getVideoTracks) return null;
-  const tracks = stream.getVideoTracks();
-  return tracks && tracks.length ? tracks[0] : null;
-}
-
-async function refocusCamera(silent = false) {
-  const track = getActiveVideoTrack();
-  if (!track || typeof track.applyConstraints !== 'function') return false;
-  try {
-    const caps = typeof track.getCapabilities === 'function' ? (track.getCapabilities() || {}) : {};
-    const advanced = [];
-    if (Array.isArray(caps.focusMode) && caps.focusMode.includes('continuous')) {
-      advanced.push({ focusMode: 'continuous' });
-    } else if (Array.isArray(caps.focusMode) && caps.focusMode.includes('single-shot')) {
-      advanced.push({ focusMode: 'single-shot' });
-    }
-    if (Array.isArray(caps.exposureMode) && caps.exposureMode.includes('continuous')) {
-      advanced.push({ exposureMode: 'continuous' });
-    }
-    if (Array.isArray(caps.whiteBalanceMode) && caps.whiteBalanceMode.includes('continuous')) {
-      advanced.push({ whiteBalanceMode: 'continuous' });
-    }
-    if (caps.sharpness && typeof caps.sharpness.max === 'number' && typeof caps.sharpness.min === 'number') {
-      const targetSharpness = Math.max(caps.sharpness.min, Math.min(caps.sharpness.max, caps.sharpness.max * 0.8));
-      advanced.push({ sharpness: targetSharpness });
-    }
-    if (caps.contrast && typeof caps.contrast.max === 'number' && typeof caps.contrast.min === 'number') {
-      const targetContrast = Math.max(caps.contrast.min, Math.min(caps.contrast.max, caps.contrast.max * 0.68));
-      advanced.push({ contrast: targetContrast });
-    }
-    if (caps.zoom && typeof caps.zoom.max === 'number' && typeof caps.zoom.min === 'number') {
-      const zoom = Math.max(caps.zoom.min, Math.min(caps.zoom.max, Math.max(1.0, caps.zoom.min + ((caps.zoom.max - caps.zoom.min) * 0.22))));
-      advanced.push({ zoom });
-    }
-    if (!advanced.length) return false;
-    await track.applyConstraints({ advanced });
-    if (!silent) showBanner('Lens refocused', 'info');
-    return true;
-  } catch (e) {
-    if (!silent) showBanner('Refocus not supported on this camera', 'warning');
-    return false;
-  }
-}
-
-function maybeAutoRefocusByConfidence(confidence) {
-  const conf = typeof confidence === 'number' ? confidence : 0;
-  if (conf >= 0.95) return;
-  const now = Date.now();
-  if ((now - lastAutoRefocusAt) < 2500) return;
-  lastAutoRefocusAt = now;
-  refocusCamera(true);
-}
-
-function updateLiveCaptureTuning(status) {
-  const s = String(status || '');
-  if (s === 'server_busy' || s === 'client_pending') {
-    ocrBackpressureScore = Math.min(10, ocrBackpressureScore + 2);
-  } else if (s === 'accepted' || s === 'no_match' || s === 'no_text' || s === 'ready') {
-    ocrBackpressureScore = Math.max(0, ocrBackpressureScore - 1);
-  }
-  const pressure = ocrBackpressureScore / 10;
-  liveCaptureQuality = 0.72 - (pressure * 0.16);   // 0.56..0.72
-  liveCaptureWidth = Math.round(1500 - (pressure * 420)); // 1080..1500
-}
-
-async function loadCameras() {
-  if (typeof Html5Qrcode === 'undefined') {
-    const sel = document.getElementById('cameraSel');
-    if (sel) sel.innerHTML = '<option value="environment">Back Camera</option><option value="user">Front Camera</option>';
-    showBanner('Camera module missing. Reload page to continue.', 'warning');
-    return;
-  }
-  try {
-    cameras = await Html5Qrcode.getCameras();
-    const sel = document.getElementById('cameraSel');
-    if (cameras && cameras.length > 0) {
-      // Add standard options first just in case
-      let html = '<option value="environment">Back Camera</option><option value="user">Front Camera</option>';
-      html += cameras.map((c,i) => `<option value="${c.id}">${c.label || 'Lens '+(i+1)}</option>`).join('');
-      sel.innerHTML = html;
-      const wants = cameraPreference || 'environment';
-      if (wants === 'environment' || wants === 'user') {
-        useFacingMode = true;
-        currentFacingMode = wants;
-        sel.value = wants;
-      } else if (cameras.some((c) => c.id === wants)) {
-        useFacingMode = false;
-        selectedCam = wants;
-        sel.value = wants;
-      } else {
-        useFacingMode = true;
-        currentFacingMode = 'environment';
-        sel.value = 'environment';
-      }
-    } else {
-      throw new Error("No cameras");
-    }
-  } catch(e) { 
-    // Fallback if permission rejected or unsupported before start
-    const sel = document.getElementById('cameraSel');
-    sel.innerHTML = '<option value="environment">Back Camera</option><option value="user">Front Camera</option>';
-    useFacingMode = true;
-    currentFacingMode = (cameraPreference === 'user') ? 'user' : 'environment';
-    sel.value = currentFacingMode;
-  }
-}
-
-function switchCamera() {
-  const val = document.getElementById('cameraSel').value;
-  if (val === 'environment' || val === 'user') {
-    useFacingMode = true;
-    currentFacingMode = val;
-  } else {
-    useFacingMode = false;
-    selectedCam = val;
-  }
-  cameraPreference = val;
-  localStorage.setItem('nab_camera_pref', cameraPreference);
-  if (settingsAppliedFromServer) scheduleUserSettingsSync();
-  if (isScanning) stopScanner().then(() => setTimeout(startScanner, 300));
-}
-
-function isMobile() {
-  return /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) || window.innerWidth < 600;
-}
-
-function isSecureCameraContext() {
-  const host = window.location.hostname || '';
-  if (window.isSecureContext) return true;
-  if (host === 'localhost' || host === '127.0.0.1' || host === '::1') return true;
-  return false;
-}
-
-function startScanner() {
-  if (typeof Html5Qrcode === 'undefined') {
-    toast('Camera library not loaded. Reload page.');
-    showBanner('Camera engine failed to load. Check internet or refresh browser.', 'warning');
-    return;
-  }
-  if (!isSecureCameraContext()) {
-    showBanner('Camera requires HTTPS on phone browsers. Open HTTPS URL or localhost.', 'warning');
-    toast('Camera blocked on HTTP (browser security policy)');
-    return;
-  }
-  document.getElementById('reader').innerHTML = '';
-  try {
-    scanner = new Html5Qrcode('reader');
-  } catch (e) {
-    toast('⚠️ Camera init failed: ' + (e && e.message ? e.message : e));
-    return;
-  }
-  
-  let cfg;
-  if (useFacingMode) {
-      cfg = { facingMode: currentFacingMode };
-  } else {
-      cfg = selectedCam ? { deviceId: { exact: selectedCam } } : { facingMode: 'environment' };
-  }
-  
-  // Adapt scan region proportionally 
-  const mobile = isMobile();
-  const qrboxFn = function(viewfinderWidth, viewfinderHeight) {
-      let minEdgePercentage = 0.85; // 85% width
-      let w = Math.floor(viewfinderWidth * minEdgePercentage);
-      let h = 130; // Ideal height for 1D barcodes
-      return { width: w, height: h };
-  };
-  
-  scanner.start(cfg,
-    { fps: mobile ? 10 : 15, 
-      qrbox: qrboxFn,
-      disableFlip: false,
-      experimentalFeatures:{ useBarCodeDetectorIfSupported:true }
-    },
-    (decoded) => onScan(decoded, { confidence: 1, source: 'barcode' }), ()=>{}
-  ).then(() => {
-    isScanning = true;
-    goodFrameStreak = 0;
-    badFrameStreak = 0;
-    hideScanHold();
-    ocrAwaitingServer = false;
-    stopPhotoOnlyStream();
-    const sBtn = document.getElementById('startBtn');
-    sBtn.classList.remove('btn-pulse');
-    updateCaptureControls();
-    if (sock) sock.emit('scanner_state', { scanning: true, serial_profile: serialProfile });
-    refocusCamera(true);
-    queueNextOcr(200);
-  }).catch(e => {
-    const msg = String((e && e.message) ? e.message : e || '');
-    if (msg.toLowerCase().includes('permission')) {
-      showBanner('Camera permission denied. Allow camera in browser settings.', 'warning');
-    } else if (msg.toLowerCase().includes('secure') || msg.toLowerCase().includes('https')) {
-      showBanner('Camera needs HTTPS on phone. Use https://... or install cert.', 'warning');
-    }
-    toast('⚠️ Camera: ' + msg);
-  });
-}
-
-function stopScanner() {
-  return new Promise(r => {
-    if (ocrTimer) { clearTimeout(ocrTimer); ocrTimer = null; }
-    hideScanHold();
-    clearOcrAwaitState();
-    if (scanner && isScanning) {
-      scanner.stop().then(() => {
-        isScanning = false;
-        goodFrameStreak = 0;
-        badFrameStreak = 0;
-        if (sock) sock.emit('scanner_state', { scanning: false, serial_profile: serialProfile });
-        const sBtn = document.getElementById('startBtn');
-        sBtn.classList.add('btn-pulse');
-        updateCaptureControls();
-        r();
-      }).catch(() => {
-        isScanning = false;
-        goodFrameStreak = 0;
-        badFrameStreak = 0;
-        if (sock) sock.emit('scanner_state', { scanning: false, serial_profile: serialProfile });
-        updateCaptureControls();
-        r();
-      });
-    } else {
-      goodFrameStreak = 0;
-      badFrameStreak = 0;
-      updateCaptureControls();
-      stopPhotoOnlyStream();
-      r();
-    }
-  });
-
-  return true;
-}
-
-// ============================================
-// Scan handler
-// ============================================
-function onScan(decoded, meta = {}) {
-  if (typeof meta.confidence === 'number') {
-    latestOcrConfidence = meta.confidence;
-  }
-  if (meta && typeof meta.cropImage === 'string' && meta.cropImage) {
-    latestOcrCropImage = meta.cropImage;
-  }
-  refreshChecksetIfStale();
-  if (scanHoldActive) return;
-  if (!requireSelectedBox('scanning')) return;
-  const normalized = normalizeClientSerial(decoded, serialProfile);
-  if (!isLikelySerialForProfile(normalized, serialProfile)) return;
-  if (activeFunction === 'inventory' && allowedCheckSet.size > 0 && !allowedCheckSet.has(normalized)) {
-    showBanner('Not in check.csv. Ignored.', 'warning');
-    return;
-  }
-
-  const now = Date.now();
-  if (normalized === lastCode && (now - lastCodeTime) < 3000) return;
-  lastCode = normalized; lastCodeTime = now;
-
-  const dupeCount = scanHistory.filter(h => h.serial === normalized).length;
-  const isDupe = dupeCount > 0;
-  const listedInCheckCsv = allowedCheckSet.size > 0 && allowedCheckSet.has(normalized);
-  const listedInBoxCsv = (
-    activeFunction !== 'import'
-    && !!selectedBoxId
-    && !!allBoxes[selectedBoxId]
-    && Array.isArray(allBoxes[selectedBoxId].target)
-    && allBoxes[selectedBoxId].target.includes(normalized)
-  );
-  const isListedInCsv = listedInCheckCsv || listedInBoxCsv;
-
-  if (isDupe) {
-    beepDupe();
-    flash('warning');
-    if (navigator.vibrate) navigator.vibrate([100, 50, 100]);
-    showBanner('⚠️ Duplicate ×' + (dupeCount+1) + ': <span class="mono">' + esc(normalized) + '</span>', 'warning');
-  } else {
-    beep();
-    flash('success');
-    if (navigator.vibrate) navigator.vibrate(100);
-    showBanner('🔍 Scanned: <span class="mono">' + esc(normalized) + '</span>', 'info');
-  }
-
-  if (scanner && isScanning) {
-    scanner.pause(true);
-  }
-
-  const autosaveEnabled = !!document.getElementById('autosave')?.checked;
-  if (autosaveEnabled && activeFunction === 'inventory') {
-    emitSave(normalized, meta.source === 'barcode' ? 'camera' : 'camera');
-    if (scanner && isScanning) {
-      try { scanner.resume(); } catch(e) {}
-      queueNextOcr(180);
-    }
-    return;
-  }
-
-  showScanHold(normalized, isDupe, true, latestOcrCropImage, isListedInCsv);
-}
-
-function emitSave(serial, method) {
-  if (!sock) return;
-  if (!requireSelectedBox('saving')) return;
-  const payload = { 
-    serial: serial.trim(), 
-    method, 
-    user: userName,
-    function_mode: activeFunction,
-    box_id: selectedBoxId || null,
-    ocr_confidence: latestOcrConfidence || 0,
-    crop_image: latestOcrCropImage || '',
-    serial_profile: serialProfile
-  };
-  sock.emit('save_scan', payload);
-}
-
-function saveManual() {
-  const input = document.getElementById('manualInput');
-  const serial = (input.value || '').trim();
-  if (!serial) return;
-  
-  if (activeFunction === 'import') {
-    sock.emit('add_to_checklist', { serial, manual: true, serial_profile: serialProfile });
-  } else {
-    if (!requireSelectedBox('manual save')) return;
-    const payload = { 
-      serial, 
-      method: 'manual', 
-      user: userName,
-      function_mode: activeFunction,
-      box_id: selectedBoxId || null,
-      ocr_confidence: 0,
-      crop_image: '',
-      serial_profile: serialProfile
-    };
-    sock.emit('save_scan', payload);
-  }
-  input.value = '';
-  input.focus();
-}
-
-function deleteEntry(serial, timestamp) {
-  const label = `${serial || ''}${timestamp ? ' @ ' + timestamp : ''}`;
-  if (!confirm(`Delete scan ${label}?`)) return;
-  sock.emit('delete_scan', { serial, timestamp });
-}
-
-function clearAll() {
-  if (!confirm('Clear ALL scan history?')) return;
-  sock.emit('clear_all');
-}
-
-function downloadCSV() { window.open('/download', '_blank'); }
-
-function downloadLaneCSV() {
-  const lane = selectedLane || 'General';
-  window.open('/download/lane/' + encodeURIComponent(lane), '_blank');
-}
-
-function downloadCropManifest() {
-  window.open('/download/crops-manifest', '_blank');
-}
-
-function openCropPreview(filename, meta = '') {
-  if (!filename) return;
-  previewCropFilename = filename;
-  const modal = document.getElementById('cropPreviewModal');
-  const img = document.getElementById('cropPreviewImage');
-  const metaEl = document.getElementById('cropPreviewMeta');
-  if (!modal || !img || !metaEl) return;
-  metaEl.textContent = meta || filename;
-  img.src = '/download/crop/' + encodeURIComponent(filename);
-  modal.style.display = 'grid';
-}
-
-function closeCropPreview() {
-  previewCropFilename = '';
-  const modal = document.getElementById('cropPreviewModal');
-  const img = document.getElementById('cropPreviewImage');
-  if (img) img.src = '';
-  if (modal) modal.style.display = 'none';
-}
-
-function downloadCropPreview() {
-  if (!previewCropFilename) return;
-  window.open('/download/crop/' + encodeURIComponent(previewCropFilename), '_blank');
-}
-
-function isTypingInInputTarget(target) {
-  if (!target) return false;
-  const tag = (target.tagName || '').toUpperCase();
-  return tag === 'INPUT' || tag === 'TEXTAREA' || target.isContentEditable;
-}
-
-// ============================================
-// QR Access
-// ============================================
-function showQr() {
-  document.getElementById('qrModal').style.display = 'grid';
-  requestQrCode();
-}
-function closeQr() {
-  if (qrRequestTimer) {
-    clearTimeout(qrRequestTimer);
-    qrRequestTimer = null;
-  }
-  qrRequestInFlight = false;
-  document.getElementById('qrModal').style.display = 'none';
-}
-function copyUrl() {
-  const url = document.getElementById('netUrlText').textContent;
-  if (!url) return;
-  const temp = document.createElement('input');
-  temp.value = url;
-  document.body.appendChild(temp);
-  temp.select();
-  document.execCommand('copy');
-  document.body.removeChild(temp);
-  toast('URL copied to clipboard');
-}
-
-function setQrLoading(loading, note = 'Generating QR…') {
-  const img = document.getElementById('qrImage');
-  const text = document.getElementById('netUrlText');
-  if (img) {
-    if (loading) {
-      img.removeAttribute('src');
-      img.style.opacity = '0.45';
-    } else {
-      img.style.opacity = '1';
-    }
-  }
-  if (text && loading) text.textContent = note;
-}
-
-function requireSocketReady(actionLabel = 'This action') {
-  if (!joinPin && !sessionToken) {
-    showPinModal();
-    showBanner(`Enter join PIN before ${actionLabel.toLowerCase()}.`, 'warning');
-    return false;
-  }
-  if (typeof io === 'undefined') {
-    ensureSocketIoClientLoaded();
-    showBanner('Loading client libraries… retrying shortly.', 'warning');
-    return true;
-  }
-  if (!sock) {
-    try {
-      initSocket();
-      showBanner(`Starting scanner session for ${actionLabel.toLowerCase()}…`, 'info');
-      setTimeout(() => {
-        try {
-          if (sock && !sock.connected) sock.connect();
-        } catch (_e) {}
-      }, 120);
-      return true;
-    } catch (_e) {
-      showBanner(`${actionLabel} queued while starting session…`, 'warning');
-      return true;
-    }
-  }
-  if (sock.connected) {
-    if (!isUserAuthenticated) {
-      try { sock.emit('get_session_status'); } catch (_e) {}
-      setAuthPill('session');
-      showAuthChoiceModal();
-    }
-    return true;
-  }
-  try { sock.connect(); } catch (_e) {}
-  showBanner(`${actionLabel} queued while reconnecting…`, 'warning');
-  return true;
-}
-
-function ensureSocketIoClientLoaded() {
-  if (typeof io !== 'undefined') return;
-  if (socketIoClientLoading) return;
-  socketIoClientLoading = true;
-  const sources = [
-    '/static/vendor/socket.io.min.js',
-    'https://cdn.jsdelivr.net/npm/socket.io-client@4.8.1/dist/socket.io.min.js',
-    'https://unpkg.com/socket.io-client@4.8.1/dist/socket.io.min.js',
-  ];
-  const tryLoad = (index) => {
-    if (index >= sources.length) {
-      socketIoClientLoading = false;
-      showBanner('Failed loading socket client. Check connection and retry.', 'warning');
-      return;
-    }
-    const script = document.createElement('script');
-    script.src = sources[index];
-    script.async = true;
-    script.crossOrigin = 'anonymous';
-    script.onload = () => {
-      socketIoClientLoading = false;
-      try {
-        if (!sock) initSocket();
-        else if (!sock.connected) sock.connect();
-        showBanner('Client libraries loaded.', 'info');
-      } catch (_e) {
-        showBanner('Session reconnect failed. Please reload page.', 'warning');
-      }
-    };
-    script.onerror = () => tryLoad(index + 1);
-    document.head.appendChild(script);
-  };
-  tryLoad(0);
-}
-
-function emitWhenConnected(event, payload, actionLabel = 'Action') {
-  if (sock && sock.connected && isUserAuthenticated) {
-    sock.emit(event, payload);
-    return true;
-  }
-  pendingSocketEmits.push({ event, payload });
-  if (sock && sock.connected && !isUserAuthenticated) {
-    setAuthPill('session');
-    showAuthChoiceModal();
-  }
-  requireSocketReady(actionLabel);
-  return false;
-}
-
-function flushPendingSocketEmits() {
-  if (!(sock && sock.connected) || !isUserAuthenticated || !pendingSocketEmits.length) return;
-  const queued = pendingSocketEmits.slice();
-  pendingSocketEmits = [];
-  queued.forEach((item) => {
-    try { sock.emit(item.event, item.payload); } catch (_e) {}
-  });
-}
-
-function requireSelectedBox(actionLabel = 'scan') {
-  if (activeFunction === 'import') return true;
-  if (selectedBoxId && allBoxes[selectedBoxId]) return true;
-  const ids = Object.keys(allBoxes || {});
-  if (ids.length > 0) {
-    const first = ids[0];
-    saveSelectedBox(first);
-    if (sock && sock.connected) {
-      try { joinBox(first); } catch (_e) {}
-    }
-    showBanner(`Using box: ${allBoxes[first]?.name || first}`, 'info');
-    return true;
-  }
-  if (sock && sock.connected && !autoBoxCreatePending) {
-    autoBoxCreatePending = true;
-    try {
-      sock.emit('box_create', { name: 'General', serial_profile: serialProfile });
-      showBanner('No box found. Creating General box…', 'info');
-    } catch (_e) {}
-    setTimeout(() => { autoBoxCreatePending = false; }, 2000);
-  }
-  showBanner(`Select or create a box before ${actionLabel}.`, 'warning');
-  return false;
-}
-
-function showQrError(message) {
-  const txt = document.getElementById('netUrlText');
-  if (txt) txt.textContent = message || 'Failed to generate QR';
-  toast(message || 'QR request failed');
-}
-
-function applyQrData(data) {
-  const img = document.getElementById('qrImage');
-  const txt = document.getElementById('netUrlText');
-  if (!img || !txt) return;
-  const url = String(data.url || '').trim();
-  const b64 = String(data.b64 || '').trim();
-  txt.textContent = url || `${window.location.protocol}//${window.location.host}/`;
-  if (b64) {
-    img.src = `data:image/png;base64,${b64}`;
-    img.style.opacity = '1';
-  } else {
-    img.removeAttribute('src');
-    img.style.opacity = '0.45';
-    if (data.reason) toast(data.reason);
-  }
-}
-
-async function requestQrCode() {
-  if (qrRequestInFlight) return;
-  qrRequestInFlight = true;
-  setQrLoading(true);
-  const fallbackFetch = async () => {
-    try {
-      const res = await fetch('/qr-data', { cache: 'no-store' });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      applyQrData(data || {});
-    } catch (e) {
-      showQrError('QR not available. Use copied URL.');
-    } finally {
-      qrRequestInFlight = false;
-      setQrLoading(false);
-    }
-  };
-  // Prefer HTTP fetch first so QR still works even when socket is reconnecting.
-  if (!(sock && sock.connected)) {
-    await fallbackFetch();
-    return;
-  }
-  if (sock && sock.connected) {
-    try {
-      sock.emit('get_qr_code');
-    } catch (_e) {
-      await fallbackFetch();
-      return;
-    }
-    qrRequestTimer = setTimeout(() => { fallbackFetch(); }, 1800);
-    return;
-  }
-  await fallbackFetch();
-}
-
-// ============================================
-// Box Management
-// ============================================
-function showBoxCreate() {
-  document.getElementById('boxNameInput').value = '';
-  document.getElementById('boxCreateModal').style.display = 'grid';
-  setTimeout(() => document.getElementById('boxNameInput').focus(), 150);
-}
-function closeBoxCreate() {
-  document.getElementById('boxCreateModal').style.display = 'none';
-}
-function submitBoxCreate() {
-  const name = document.getElementById('boxNameInput').value.trim();
-  if (!name) return;
-  emitWhenConnected('box_create', { name, serial_profile: serialProfile }, 'Create box');
-  closeBoxCreate();
-}
-
-function showBoxImport() {
-  document.getElementById('boxImportInput').value = '';
-  document.getElementById('boxImportModal').style.display = 'grid';
-  setTimeout(() => document.getElementById('boxImportInput').focus(), 150);
-}
-function closeBoxImport() {
-  document.getElementById('boxImportModal').style.display = 'none';
-}
-function submitBoxImport() {
-  if (!selectedBoxId) return;
-  const text = document.getElementById('boxImportInput').value.trim();
-  if (!text) return;
-  emitWhenConnected('box_import_target', { box_id: selectedBoxId, text, serial_profile: serialProfile }, 'Import target list');
-  closeBoxImport();
-}
-
-function onBoxChange() {
-  const sel = document.getElementById('boxSel');
-  if (!sel) return;
-  const nextId = sel.value || '';
-  if (!nextId) return;
-  if (!requireSocketReady('Switch box')) return;
-  saveSelectedBox(nextId);
-  joinBox(nextId);
-}
-
-function joinBox(boxId) {
-  if (!boxId) return;
-  if (pendingBoxJoinId === boxId) return;
-  const alreadyJoined = allBoxes[boxId] && allBoxes[boxId].joined;
-  if (alreadyJoined && selectedBoxId === boxId) return;
-  pendingBoxJoinId = boxId;
-  emitWhenConnected('box_join', { box_id: boxId }, 'Join box');
-}
-
-function toggleBoxClosed() {
-  if (!selectedBoxId) return;
-  const box = allBoxes[selectedBoxId];
-  if (!box) return;
-  emitWhenConnected('box_set_closed', { box_id: selectedBoxId, closed: !box.closed }, 'Update box');
-}
-
-function downloadBoxSummary() {
-  if (!selectedBoxId) return;
-  window.open('/download/box/' + encodeURIComponent(selectedBoxId), '_blank');
-}
-
-function flashFoundSerial(serial) {
-  if (!serial) return;
-  lastBoxFoundSerial = serial;
-  const el = document.getElementById('boxFoundFlash');
-  if (!el) return;
-  el.textContent = `✓ Found ${serial} in target list`;
-  el.classList.add('show');
-  if (boxFoundFlashTimer) clearTimeout(boxFoundFlashTimer);
-  boxFoundFlashTimer = setTimeout(() => {
-    el.classList.remove('show');
-    el.textContent = 'Waiting for matched serial…';
-  }, 2600);
-}
-
-function renderBoxes() {
-  const sel = document.getElementById('boxSel');
-  const lobby = document.getElementById('boxLobbyList');
-  if (!sel || !lobby) return;
-  
-  const boxIds = Object.keys(allBoxes);
-  if (boxIds.length === 0) {
-    sel.innerHTML = '<option value="">No Boxes Create…</option>';
-    lobby.innerHTML = '<div class="box-lobby-item"><div><strong>No boxes</strong><div class="box-lobby-meta">Create a box to start collaborative counting.</div></div></div>';
-    document.getElementById('boxStatusCard').style.display = 'none';
-    saveSelectedBox('');
-    return;
-  }
-  
-  const currentId = (selectedBoxId && allBoxes[selectedBoxId]) ? selectedBoxId : boxIds[0];
-  saveSelectedBox(currentId);
-  
-  sel.innerHTML = boxIds.map(id => {
-    const b = allBoxes[id];
-    const pct = typeof b.progress_pct === 'number'
-      ? b.progress_pct
-      : ((b.target?.length || 0) ? Math.round(((b.scanned?.length || 0) / (b.target?.length || 1)) * 100) : 0);
-    const lock = b.closed ? '🔒 ' : '';
-    return `<option value="${id}" ${id === currentId ? 'selected' : ''}>${lock}${esc(b.name)} • ${pct}% • ${b.active_users || 0} online</option>`;
-  }).join('');
-  
-  const box = allBoxes[currentId];
-  if (!box) return;
-  if (sock && !box.joined && activeFunction === 'box') {
-    joinBox(currentId);
-  }
-  
-  lobby.innerHTML = boxIds.map(id => {
-    const b = allBoxes[id];
-    const scanned = (b.scanned || []).length;
-    const target = (b.target || []).length;
-    const pct = target > 0 ? Math.round((scanned / target) * 100) : 0;
-    const closed = b.closed ? '<span class="feed-badge fb-dupe">closed</span>' : '';
-    const isActive = id === currentId ? 'active' : '';
-    return `<div class="box-lobby-item ${isActive}" onclick="joinBox('${id}')">
-      <div>
-        <div style="font-size:12px;font-weight:700;">${esc(b.name)} ${closed}</div>
-        <div class="box-lobby-meta">${scanned}/${target} • ${pct}% • ${b.active_users || 0} users</div>
-      </div>
-      <button class="btn btn-ghost btn-sm" onclick="event.stopPropagation(); joinBox('${id}')">Join</button>
-    </div>`;
-  }).join('');
-
-  document.getElementById('boxStatusCard').style.display = 'block';
-  const scannedCount = (box.scanned || []).length;
-  const targetCount = (box.target || []).length;
-  const percent = targetCount > 0 ? Math.round((scannedCount / targetCount) * 100) : 0;
-  
-  document.getElementById('boxStatsText').textContent = `${scannedCount} / ${targetCount} scanned`;
-  document.getElementById('boxPercentText').textContent = `${percent}%`;
-  document.getElementById('boxProgressFill').style.width = `${percent}%`;
-  const closeBtn = document.getElementById('boxCloseBtn');
-  if (closeBtn) closeBtn.textContent = box.closed ? '🔓 Reopen Box' : '🔒 Close Box';
-
-  const collabs = Array.isArray(box.collaborators) ? box.collaborators : [];
-  const collabText = collabs.length
-    ? collabs.map(c => `${c.name}${c.session_state === 'scanning' ? ' (scanning)' : ''}`).join(', ')
-    : 'No collaborators yet.';
-  const collabEl = document.getElementById('boxCollabs');
-  if (collabEl) collabEl.textContent = `In this box: ${collabText}`;
-  
-  const missing = (box.target || []).filter(s => !(box.scanned || []).includes(s));
-  const listEl = document.getElementById('boxMissingList');
-  if (missing.length === 0 && targetCount > 0) {
-    listEl.innerHTML = '<div style="color:var(--success); font-weight:700;">★ BOX COMPLETE</div>';
-  } else if (targetCount === 0) {
-    listEl.innerHTML = 'No target list imported.';
-  } else {
-    listEl.innerHTML = missing.map(s => {
-      const hitClass = lastBoxFoundSerial && s === lastBoxFoundSerial ? ' style="color:var(--success);font-weight:700;"' : '';
-      return `<div${hitClass}>• ${esc(s)}</div>`;
-    }).join('');
-  }
-  
-  document.getElementById('boxMissingTitle').textContent = `Missing Serials (${missing.length})`;
-  renderFeed();
-}
-
-function toggleBoxMissing() {
-  boxMissingVisible = !boxMissingVisible;
-  document.getElementById('boxMissingList').style.display = boxMissingVisible ? 'block' : 'none';
-  document.getElementById('boxMissingToggleBtn').textContent = boxMissingVisible ? 'Hide List' : 'Show List';
-}
-
-function deleteActiveBox() {
-  if (!selectedBoxId) return;
-  if (!confirm('Permanently delete this box and its count data?')) return;
-  emitWhenConnected('box_delete', { box_id: selectedBoxId }, 'Delete box');
-}
-
-// ============================================
-// Rendering
-// ============================================
-function renderFeed() {
-  const el = document.getElementById('feedList');
-  const countEl = document.getElementById('feedCount');
-  const q = document.getElementById('searchBox').value.toLowerCase().trim();
-  const titleEl = document.getElementById('feedTitle');
-  if (titleEl) {
-    if (activeFunction === 'box' && selectedBoxId && allBoxes[selectedBoxId]) {
-      titleEl.textContent = `⚡ Live Feed • Box ${allBoxes[selectedBoxId].name || selectedBoxId}`;
-    } else {
-      titleEl.textContent = '⚡ Live Feed';
-    }
-  }
-
-  if (activeFunction === 'box') {
-    const box = selectedBoxId ? allBoxes[selectedBoxId] : null;
-    if (!box) {
-      if (countEl) countEl.textContent = '0 items';
-      el.innerHTML = '<div class="feed-empty"><div class="icon">📦</div>Select a box to view scanned serials</div>';
-      return;
-    }
-    const scans = Array.isArray(box.recent_scans) ? [...box.recent_scans].reverse() : [];
-    const filtered = q
-      ? scans.filter((s) =>
-          (s.serial || '').toLowerCase().includes(q)
-          || (s.user || '').toLowerCase().includes(q)
-          || (s.timestamp || '').toLowerCase().includes(q)
-        )
-      : scans;
-    if (!filtered.length) {
-      if (countEl) countEl.textContent = '0 items';
-      el.innerHTML = '<div class="feed-empty"><div class="icon">📦</div>No scanned serials in this box yet</div>';
-      return;
-    }
-    if (countEl) countEl.textContent = `${filtered.length} items`;
-    el.innerHTML = filtered.slice(0, 400).map((s) => {
-      const color = getUserColor(s.user || 'anon');
-      const initials = (s.user || '?').slice(0,2).toUpperCase();
-      const targetBadge = s.in_target
-        ? `<span class="feed-badge fb-check">✓ target</span>`
-        : `<span class="feed-badge fb-dupe">extra</span>`;
-      const dupeBadge = s.duplicate_in_box
-        ? `<span class="feed-badge fb-dupe">duplicate</span>`
-        : '';
-      const methodBadge = s.method === 'manual'
-        ? `<span class="feed-badge fb-manual">manual</span>`
-        : `<span class="feed-badge fb-camera">camera</span>`;
-      const cropThumb = s.crop_latest_file
-        ? `<img class="feed-thumb" src="/download/crop/${encodeURIComponent(s.crop_latest_file)}" alt="crop" onclick="openCropPreview('${esc(s.crop_latest_file)}','${esc((s.serial || '-') + ' • ' + (s.timestamp || ''))}')">`
-        : '';
-      return `
-      <div class="feed-item">
-        <div class="feed-avatar" style="background:${color}20;color:${color}">${initials}</div>
-        ${cropThumb}
-        <div class="feed-content">
-          <div class="feed-serial">${s.in_target ? '<span class="feed-check-icon">✔</span>' : ''}${esc(s.serial || '-')}</div>
-          <div class="feed-meta">
-            <span>${esc(s.user || 'anon')}</span>
-            <span>${esc(s.timestamp || '')}</span>
-            ${methodBadge}
-            ${targetBadge}
-            ${dupeBadge}
-          </div>
-        </div>
-      </div>`;
-    }).join('');
-    return;
-  }
-
-  const grouped = new Map();
-  for (const h of scanHistory) {
-    if (!h || !h.serial) continue;
-    const rowLane = h.lane || 'General';
-    const key = h.serial;
-    if (!grouped.has(key)) {
-      grouped.set(key, {
-        serial: h.serial,
-        latestTimestamp: h.timestamp,
-        latestMethod: h.method || 'manual',
-        latestUser: h.user || 'anon',
-        lane: rowLane,
-        checked: !!h.checked,
-        cropLatestFile: h.crop_latest_file || '',
-        ocrConfidence: typeof h.ocr_confidence === 'number' ? h.ocr_confidence : 0,
-        users: new Set([h.user || 'anon']),
-        count: 1,
-      });
-      continue;
-    }
-    const g = grouped.get(key);
-    g.count += 1;
-    g.users.add(h.user || 'anon');
-    if (!g.cropLatestFile && h.crop_latest_file) g.cropLatestFile = h.crop_latest_file;
-    if (typeof h.ocr_confidence === 'number' && h.ocr_confidence > g.ocrConfidence) g.ocrConfidence = h.ocr_confidence;
-  }
-
-  let items = Array.from(grouped.values());
-  if (q) {
-    items = items.filter(g =>
-      g.serial.toLowerCase().includes(q)
-    );
-  }
-
-    if (!items.length) {
-      if (countEl) countEl.textContent = '0 items';
-      const noDataHint = 'No scanned serials yet';
-      el.innerHTML = `<div class="feed-empty"><div class="icon">${q?'🔍':'📡'}</div>${q?'No matches':noDataHint}</div>`;
-      return;
-    }
-    if (countEl) countEl.textContent = `${items.length} items`;
-
-  el.innerHTML = items.map((g) => {
-    const color = getUserColor(g.latestUser || 'anon');
-    const initials = (g.latestUser || '?').slice(0,2).toUpperCase();
-    const countBadge = g.count > 1
-      ? `<span class="feed-badge fb-dupe" style="margin-left:4px">×${g.count}</span>`
-      : '';
-    const checkedBadge = g.checked ? `<span class="feed-badge fb-check" style="margin-left:6px">✓ check.csv</span>` : '';
-    const confBadge = g.ocrConfidence > 0
-      ? `<span class="feed-badge fb-camera" style="margin-left:6px">${Math.round(g.ocrConfidence * 100)}%</span>`
-      : '';
-    const cropThumb = g.cropLatestFile
-      ? `<img class="feed-thumb" src="/download/crop/${encodeURIComponent(g.cropLatestFile)}" alt="crop" onclick="openCropPreview('${esc(g.cropLatestFile)}','${esc((g.serial || '-') + ' • ' + (g.latestTimestamp || ''))}')">`
-      : '';
-    return `
-      <div class="feed-item">
-        <div class="feed-avatar" style="background:${color}20;color:${color}">${initials}</div>
-        ${cropThumb}
-        <div class="feed-content">
-          <div class="feed-serial">${g.checked ? '<span class="feed-check-icon">✔</span>' : ''}${esc(g.serial)}${countBadge}${checkedBadge}${confBadge}</div>
-        </div>
-        <button class="feed-delete" onclick="deleteEntry('${esc(g.serial)}','${g.latestTimestamp}')" title="Delete latest">🗑</button>
-      </div>`;
-  }).join('');
-}
-
-function renderUsers(users) {
-  const el = document.getElementById('usersList');
-  if (!users.length) {
-    el.innerHTML = '<div class="feed-empty"><div class="icon">👤</div>No users</div>';
-    return;
-  }
-  el.innerHTML = users.map(u => {
-    const color = getUserColor(u.name);
-    const isMe = u.sid === currentSessionId;
-    const statusClass = u.session_state === 'scanning'
-      ? 'ub-scanning'
-      : u.session_state === 'photo'
-        ? 'ub-photo'
-        : u.session_state === 'manual'
-          ? 'ub-manual'
-          : 'ub-idle';
-    const statusLabel = u.session_state || 'idle';
-    const boxInfo = u.box_id ? ` • box ${u.box_id}` : '';
-    return `
-      <div class="user-row">
-        <span class="user-dot" style="background:${color}"></span>
-        <div>
-          <div class="user-name">
-            ${esc(u.name)}
-            ${isMe?'<span class="user-you">YOU</span>':''}
-            <span class="user-badge ${statusClass}">${esc(statusLabel)}</span>
-          </div>
-          <div class="user-info">${u.ip} &bull; joined ${u.connected_at} &bull; active ${u.last_active_at || u.connected_at}${boxInfo}</div>
-        </div>
-      </div>`;
-  }).join('');
-}
-
-function updateStats() {
-  const now = new Date();
-  const today = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}`;
-  const todayN = scanHistory.filter(h => h.timestamp.startsWith(today)).length;
-  const unique = new Set(scanHistory.map(h => h.serial));
-  document.getElementById('sTotal').textContent = scanHistory.length;
-  document.getElementById('sToday').textContent = todayN;
-  document.getElementById('sUnique').textContent = unique.size;
-  document.getElementById('sDupes').textContent = scanHistory.length - unique.size;
-}
-
-function showBanner(html, type) {
-  const el = document.getElementById('banner');
-  el.className = 'banner show ' + type;
-  el.innerHTML = html;
-  clearTimeout(el._t);
-  el._t = setTimeout(() => el.classList.remove('show'), 3000);
-}
-
-function flash(type) {
-  const el = document.getElementById('scanFlash');
-  const colors = { success:'rgba(16,185,129,0.06)', warning:'rgba(245,158,11,0.06)', info:'rgba(59,130,246,0.06)' };
-  el.style.background = colors[type] || colors.info;
-  el.classList.add('on');
-  setTimeout(() => el.classList.remove('on'), 200);
-}
-
-function toast(msg) {
-  const c = document.getElementById('toasts');
-  const t = document.createElement('div');
-  t.className = 'toast-msg';
-  t.textContent = msg;
-  c.appendChild(t);
-  setTimeout(() => t.remove(), 3000);
-}
-
-function esc(s) {
-  const d = document.createElement('div');
-  d.textContent = s;
-  return d.innerHTML;
-}
-
-function normalizeClientSerial(value, profile = serialProfile) {
-  const p = normalizeSerialProfile(profile);
-  const cleaned = (value || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
-  if (p === 'dell') {
-    if (cleaned.startsWith('ST') && cleaned.length >= 9) return cleaned.slice(2, 9);
-    return cleaned;
-  }
-  let out = cleaned.replace(/O/g, '0').replace(/I/g, '1');
-  // Apple barcode may contain a leading "S" that is not part of the serial.
-  if (out.startsWith('S') && !out.startsWith('SE') && !out.startsWith('SN') && (out.length === 11 || out.length === 13)) {
-    const tail = out.slice(1);
-    const hasLetter = /[A-Z]/.test(tail);
-    const hasDigit = /\\d/.test(tail);
-    if (hasLetter && hasDigit) out = tail;
-  }
-  return out;
-}
-
-function isLikelySerialForProfile(value, profile = serialProfile) {
-  const p = normalizeSerialProfile(profile);
-  const serial = normalizeClientSerial(value, p);
-  if (p === 'dell') {
-    return serial.length === 7
-      && /^[A-Z0-9]{7}$/.test(serial)
-      && /[A-Z]/.test(serial)
-      && /\\d/.test(serial)
-      && !serial.startsWith('ST')
-      && !serial.startsWith('EX');
-  }
-  return (serial.length === 10 || serial.length === 12)
-    && /[A-Z]/.test(serial)
-    && /\\d/.test(serial);
-}
-
-async function loadCheckset(notify = false) {
-  try {
-    const r = await fetch(`/checkset?profile=${encodeURIComponent(serialProfile)}`, { cache: 'no-store' });
-    const data = await r.json();
-    const values = Array.isArray(data.serials) ? data.serials : [];
-    allowedCheckSet = new Set(values.map(v => normalizeClientSerial(v, serialProfile)));
-    checksetLastLoadedAt = Date.now();
-    const countEl = document.getElementById('checkCount');
-    const previewEl = document.getElementById('checkPreview');
-    if (countEl) countEl.textContent = String(values.length);
-    if (previewEl) previewEl.textContent = values.slice(0, 12).join('  ') || '-';
-    if (notify) toast(`Loaded check.csv (${values.length})`);
-  } catch (e) {
-    allowedCheckSet = new Set();
-    if (notify) toast('Failed to load check.csv');
-  }
-}
-
-async function refreshChecksetIfStale(maxAgeMs = 20000) {
-  if (!checksetLastLoadedAt || (Date.now() - checksetLastLoadedAt) > maxAgeMs) {
-    await loadCheckset();
-  }
-}
-
-// ============================================
-// Init
-// ============================================
-async function bootstrapApp() {
-  if (appBootstrapped) return;
-
-  if (!joinPin && !sessionToken) {
-    showUnifiedAuth();
-    return;
-  }
-
-  appBootstrapped = true;
-  if (userName) {
-    document.getElementById('userPill').innerHTML = '👤 ' + esc(userName);
-  }
-  await loadCameras();
-  if (!isSecureCameraContext()) {
-    showBanner('Camera on mobile needs HTTPS. HTTP mode can block camera access.', 'warning');
-  }
-  await loadCheckset();
-  if (!initSocket()) {
-    appBootstrapped = false;
-    showBanner('Loading realtime client…', 'warning');
-    return;
-  }
-  updateFunctionModeUI();
-  renderQueue();
-  maybeAutoStartScanner('bootstrap');
-  setInterval(() => { loadCheckset(); }, 30000);
-  document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') {
-      loadCheckset();
-      if (isScanning) queueNextOcr(120);
-    } else {
-      if (ocrTimer) {
-        clearTimeout(ocrTimer);
-        ocrTimer = null;
-      }
-      clearOcrAwaitState();
-    }
-  });
-  document.addEventListener('keydown', (event) => {
-    if (isTypingInInputTarget(event.target)) return;
-    const cropModal = document.getElementById('cropPreviewModal');
-    const cropOpen = cropModal && cropModal.style.display === 'grid';
-    if (event.key === 'Escape') {
-      if (cropOpen) {
-        closeCropPreview();
-        event.preventDefault();
-        return;
-      }
-      if (scanHoldActive) {
-        ignoreScanHold();
-        event.preventDefault();
-      }
-      return;
-    }
-    if (event.key === 'Enter' && scanHoldActive && !cropOpen) {
-      continueAfterScan();
-      event.preventDefault();
-    }
-  });
-  toast('✅ Native M4 OCR Link Active');
-}
-
-function init() {
-  loadJoinPinCache();
-  loadSelectedBoxCache();
-  saveCameraTuningOverrides();
-  if (!sessionToken) {
-    const st = (localStorage.getItem('nab_session_token') || '').trim();
-    if (st) sessionToken = st;
-  }
-  setSettingsPill('local');
-  setAuthPill((joinPin || sessionToken) ? 'session' : 'required');
-  updateModePill();
-  setGuideChip(`🎛 Tuning: ${getActiveCameraTuningProfile()}`, 'guide');
-  renderAdvancedTuningPanel();
-  updateCaptureControls();
-  if (joinPin || sessionToken) {
-    bootstrapApp();
-    return;
-  }
-  showUnifiedAuth();
-}
-init();
-</script>
-</body>
-</html>
-"""
-
+INDEX_TEMPLATE_PATH = os.path.join(BASE_DIR, "templates", "index.html")
+
+def render_index_html():
+    with open(INDEX_TEMPLATE_PATH, "r", encoding="utf-8") as f:
+        template = f.read()
+    return template.replace("__APP_BUILD_ID__", APP_BUILD_ID)
 
 # ============================================
 # CSV Helpers
@@ -5977,7 +1863,7 @@ def add_serial_to_checklist(serial, approved=False, confidence=0.0, manual=False
 
 @app.route("/")
 def index():
-    return LEGACY_INDEX_HTML.replace("__APP_BUILD_ID__", APP_BUILD_ID)
+    return render_index_html()
 
 
 @app.after_request
@@ -5998,6 +1884,8 @@ def set_security_headers(resp):
 
 @app.route("/download")
 def download():
+    if not require_http_session():
+        return Response("Unauthorized", status=401)
     if not os.path.isfile(CSV_FILE):
         return "No data", 404
     with open(CSV_FILE) as f:
@@ -6008,6 +1896,8 @@ def download():
 
 @app.route("/checkset")
 def checkset():
+    if not require_http_session():
+        return Response("Unauthorized", status=401)
     profile = normalize_serial_profile(request.args.get("profile", DEFAULT_SERIAL_PROFILE))
     load_check_serials()
     serials = sorted(check_serials_cache_by_profile.get(profile, set()))
@@ -6048,6 +1938,8 @@ def qr_data():
 
 @app.route("/download/lane/<path:lane_name>")
 def download_lane(lane_name):
+    if not require_http_session():
+        return Response("Unauthorized", status=401)
     rows = read_csv_rows()
     lane = normalize_lane_name(lane_name)
     lane_rows = [r for r in rows if normalize_lane_name(r.get("Lane", "General")) == lane]
@@ -6076,6 +1968,8 @@ def download_lane(lane_name):
 
 @app.route("/download/crops-manifest")
 def download_crops_manifest():
+    if not require_http_session():
+        return Response("Unauthorized", status=401)
     ensure_crop_storage()
     if not os.path.isfile(CROPS_MANIFEST_FILE):
         return "No cropped scans", 404
@@ -6089,6 +1983,8 @@ def download_crops_manifest():
 
 @app.route("/download/crop/<path:filename>")
 def download_crop_file(filename):
+    if not require_http_session():
+        return Response("Unauthorized", status=401)
     ensure_crop_storage()
     safe_name = os.path.basename(filename)
     path = os.path.join(CROPS_DIR, safe_name)
@@ -6105,6 +2001,8 @@ def download_crop_file(filename):
 
 @app.route("/download/box/<path:box_id>")
 def download_box_summary(box_id):
+    if not require_http_session():
+        return Response("Unauthorized", status=401)
     load_box_registry()
     box_id = str(box_id)
     box = box_registry.get(box_id)
@@ -6178,6 +2076,92 @@ def download_cert():
     )
 
 
+@app.route("/cert.cer")
+def download_cert_cer():
+    cert_path = os.path.join(BASE_DIR, "cert.pem")
+    if not os.path.isfile(cert_path):
+        return "Certificate not found", 404
+    try:
+        with open(cert_path, "r", encoding="utf-8") as f:
+            pem_data = f.read()
+        der_bytes = ssl.PEM_cert_to_DER_cert(pem_data)
+    except Exception:
+        return "Certificate conversion failed", 500
+    return Response(
+        der_bytes,
+        mimetype="application/pkix-cert",
+        headers={
+            "Content-Disposition": "attachment; filename=nab-serial-scanner-cert.cer",
+        },
+    )
+
+
+@app.route("/cert.mobileconfig")
+def download_cert_mobileconfig():
+    cert_path = os.path.join(BASE_DIR, "cert.pem")
+    if not os.path.isfile(cert_path):
+        return "Certificate not found", 404
+    try:
+        with open(cert_path, "r", encoding="utf-8") as f:
+            pem_data = f.read()
+        der_bytes = ssl.PEM_cert_to_DER_cert(pem_data)
+        cert_b64 = base64.b64encode(der_bytes).decode("ascii")
+        profile_uuid = str(uuid.uuid4()).upper()
+        cert_uuid = str(uuid.uuid4()).upper()
+        profile_name = "NAB Serial Scanner Local Trust"
+        profile = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>PayloadContent</key>
+  <array>
+    <dict>
+      <key>PayloadCertificateFileName</key>
+      <string>nab-serial-scanner-cert.cer</string>
+      <key>PayloadContent</key>
+      <data>{cert_b64}</data>
+      <key>PayloadDescription</key>
+      <string>Installs local HTTPS trust certificate for NAB Serial Scanner.</string>
+      <key>PayloadDisplayName</key>
+      <string>NAB Scanner Certificate</string>
+      <key>PayloadIdentifier</key>
+      <string>com.nab.serialscanner.cert.{cert_uuid.lower()}</string>
+      <key>PayloadType</key>
+      <string>com.apple.security.root</string>
+      <key>PayloadUUID</key>
+      <string>{cert_uuid}</string>
+      <key>PayloadVersion</key>
+      <integer>1</integer>
+    </dict>
+  </array>
+  <key>PayloadDescription</key>
+  <string>Install certificate to trust local scanner HTTPS endpoint.</string>
+  <key>PayloadDisplayName</key>
+  <string>{profile_name}</string>
+  <key>PayloadIdentifier</key>
+  <string>com.nab.serialscanner.profile.{profile_uuid.lower()}</string>
+  <key>PayloadRemovalDisallowed</key>
+  <false/>
+  <key>PayloadType</key>
+  <string>Configuration</string>
+  <key>PayloadUUID</key>
+  <string>{profile_uuid}</string>
+  <key>PayloadVersion</key>
+  <integer>1</integer>
+</dict>
+</plist>
+"""
+    except Exception:
+        return "Profile generation failed", 500
+    return Response(
+        profile,
+        mimetype="application/x-apple-aspen-config",
+        headers={
+            "Content-Disposition": "attachment; filename=nab-serial-scanner-cert.mobileconfig",
+        },
+    )
+
+
 # ============================================
 # Socket.IO Events
 # ============================================
@@ -6185,8 +2169,12 @@ def download_cert():
 @socketio.on("connect")
 def on_connect(auth=None):
     ip = request.remote_addr or "unknown"
+    if not check_auth_rate_limit(ip):
+        raise ConnectionRefusedError("rate_limited")
     auth = auth or {}
     client_id = re.sub(r"[^A-Za-z0-9._:-]", "", (auth.get("client_id") or "").strip())[:64]
+    if not client_id:
+        client_id = f"cli-{int(time.time() * 1000)}-{request.sid[:6]}"
     join_pin = str(auth.get("pin", "")).strip()
     auth_session_token = str(auth.get("session_token", "")).strip()
     serial_profile = normalize_serial_profile(auth.get("serial_profile", DEFAULT_SERIAL_PROFILE))
@@ -6196,11 +2184,16 @@ def on_connect(auth=None):
     load_user_registry()
     pin_user_client_id = None
     pin_user_profile = None
-    is_join_pin = join_pin_matches(join_pin)
-    if (not token_client_id) and (not is_join_pin) and join_pin:
+    is_join_pin = False
+    if (not token_client_id) and join_pin:
+        # Priority: existing user PIN first, then session join PIN.
         pin_user_client_id, pin_user_profile = find_user_by_pin(join_pin)
-    if not token_client_id and not is_join_pin and not pin_user_client_id:
+        if not pin_user_client_id:
+            is_join_pin = join_pin_matches(join_pin)
+    if not token_client_id and not pin_user_client_id and not is_join_pin:
+        record_auth_failure(ip)
         raise ConnectionRefusedError("unauthorized")
+    record_auth_success(ip)
 
     if pin_user_client_id:
         client_id = pin_user_client_id
@@ -6214,10 +2207,10 @@ def on_connect(auth=None):
     else:
         profile = user_registry.get(client_id, {}) if (client_id and authenticated_user) else {}
     display_name = ((profile.get("name") or "Anonymous").strip() or "Anonymous") if authenticated_user else "Anonymous"
-    user_settings = db_ensure_user_settings(client_id) if (client_id and authenticated_user) else dict(DEFAULT_USER_SETTINGS)
+    user_settings = db_ensure_user_settings(client_id) if client_id else dict(DEFAULT_USER_SETTINGS)
     serial_profile = normalize_serial_profile(user_settings.get("serial_profile", serial_profile))
 
-    if client_id and authenticated_user:
+    if client_id:
         previous_sid = client_session_index.get(client_id)
         if previous_sid and previous_sid != request.sid:
             remove_session(previous_sid)
@@ -6248,6 +2241,9 @@ def on_connect(auth=None):
         "last_submit": 0.0,
         "last_result": "",
         "last_result_at": 0.0,
+        "candidate_serial": "",
+        "candidate_count": 0,
+        "candidate_seen_at": 0.0,
         "recent_latencies": deque(maxlen=6),
         "serial_profile": serial_profile,
     }
@@ -6257,7 +2253,7 @@ def on_connect(auth=None):
         "name": display_name,
         "client_id": client_id,
         "authenticated_user": authenticated_user,
-        "session_token": issue_session_token(client_id) if authenticated_user else "",
+        "session_token": issue_session_token(client_id) if client_id else "",
         "settings": user_settings,
     }, to=request.sid)
 
@@ -6282,24 +2278,7 @@ def on_authenticate_pin(data):
         emit("auth_result", {"success": False, "reason": "rate_limit"}, to=request.sid)
         return
 
-    # Check for Session JOIN PIN
-    if join_pin_matches(pin):
-        record_auth_success(ip)
-        if request.sid in connected_users:
-            connected_users[request.sid]["verified"] = True
-            connected_users[request.sid]["authenticated_user"] = is_user_authenticated_session(request.sid)
-        emit_initial_data_for_sid(request.sid)
-        emit("auth_result", {"success": True, "type": "session"}, to=request.sid)
-        emit("session_status", {
-            "verified": True,
-            "authenticated_user": bool(connected_users.get(request.sid, {}).get("authenticated_user")),
-            "requires_user_auth": not bool(connected_users.get(request.sid, {}).get("authenticated_user")),
-            "session_token": issue_session_token(connected_users.get(request.sid, {}).get("client_id")) if bool(connected_users.get(request.sid, {}).get("authenticated_user")) else "",
-        }, to=request.sid)
-        broadcast_users()
-        return
-
-    # Check for User Profile PIN
+    # Check for User Profile PIN first.
     load_user_registry()
     matched_client_id, matched_profile = find_user_by_pin(pin)
     if matched_client_id:
@@ -6326,6 +2305,23 @@ def on_authenticate_pin(data):
         broadcast_users()
         return
 
+    # Then allow Session JOIN PIN.
+    if join_pin_matches(pin):
+        record_auth_success(ip)
+        if request.sid in connected_users:
+            connected_users[request.sid]["verified"] = True
+            connected_users[request.sid]["authenticated_user"] = is_user_authenticated_session(request.sid)
+        emit_initial_data_for_sid(request.sid)
+        emit("auth_result", {"success": True, "type": "session"}, to=request.sid)
+        emit("session_status", {
+            "verified": True,
+            "authenticated_user": bool(connected_users.get(request.sid, {}).get("authenticated_user")),
+            "requires_user_auth": not bool(connected_users.get(request.sid, {}).get("authenticated_user")),
+            "session_token": issue_session_token(connected_users.get(request.sid, {}).get("client_id")) if connected_users.get(request.sid, {}).get("client_id") else "",
+        }, to=request.sid)
+        broadcast_users()
+        return
+
     record_auth_failure(ip)
     emit("auth_result", {"success": False, "reason": "invalid_pin"}, to=request.sid)
 
@@ -6346,7 +2342,7 @@ def on_disconnect():
 
 @socketio.on("set_name")
 def on_set_name(data):
-    if not require_verified_session():
+    if not require_verified_session(require_user=False):
         return
     # This is now mostly handled via register_user
     name = data.get("name", "Anonymous").strip()
@@ -6379,6 +2375,10 @@ def on_register_user(data):
     if not is_reasonable_pin(pin):
         record_auth_failure(ip)
         emit("auth_error", {"reason": "invalid_pin"}, to=request.sid)
+        return
+    if join_pin_matches(pin):
+        record_auth_failure(ip)
+        emit("auth_error", {"reason": "pin_reserved"}, to=request.sid)
         return
     existing_client_id, _ = find_user_by_pin(pin, exclude_client_id=client_id)
     if existing_client_id:
@@ -6483,6 +2483,9 @@ def on_update_profile(data):
             if not is_reasonable_pin(pin):
                 emit("auth_error", {"reason": "invalid_pin"}, to=request.sid)
                 return
+            if join_pin_matches(pin):
+                emit("auth_error", {"reason": "pin_reserved"}, to=request.sid)
+                return
             existing_client_id, _ = find_user_by_pin(pin, exclude_client_id=client_id)
             if existing_client_id:
                 emit("auth_error", {"reason": "pin_in_use"}, to=request.sid)
@@ -6530,12 +2533,19 @@ def on_get_session_status():
         "requires_user_auth": bool(user.get("verified")) and not authenticated_user,
         "name": user.get("name", "Anonymous"),
         "client_id": user.get("client_id", ""),
-        "session_token": issue_session_token(user.get("client_id", "")) if authenticated_user else "",
+        "session_token": issue_session_token(user.get("client_id", "")) if user.get("client_id") else "",
     }, to=request.sid)
 
 
 @socketio.on("logout_session")
 def on_logout_session():
+    user = connected_users.get(request.sid) or {}
+    client_id = str(user.get("client_id") or "").strip()
+    if client_id and user.get("authenticated_user"):
+        db_bump_session_version(client_id)
+        cached = user_registry.get(client_id)
+        if isinstance(cached, dict):
+            cached["session_version"] = int(cached.get("session_version", 0) or 0) + 1
     if request.sid in connected_users:
         emit("logged_out", {"ok": True}, to=request.sid)
     remove_session(request.sid)
@@ -6546,7 +2556,7 @@ def on_logout_session():
 
 @socketio.on("load_user_settings")
 def on_load_user_settings():
-    if not require_verified_session():
+    if not require_verified_session(require_user=False):
         return
     user = connected_users.get(request.sid) or {}
     client_id = str(user.get("client_id") or "").strip()
@@ -6561,7 +2571,7 @@ def on_load_user_settings():
 
 @socketio.on("save_user_settings")
 def on_save_user_settings(data):
-    if not require_verified_session():
+    if not require_verified_session(require_user=False):
         return
     user = connected_users.get(request.sid) or {}
     client_id = str(user.get("client_id") or "").strip()
@@ -6584,7 +2594,7 @@ def on_save_user_settings(data):
 @socketio.on("scanner_state")
 def on_scanner_state(data):
     data = data or {}
-    if not require_verified_session():
+    if not require_verified_session(require_user=False):
         return
     state = client_ocr_state.get(request.sid)
     if state is None:
@@ -6601,6 +2611,9 @@ def on_scanner_state(data):
     else:
         state["started_scanning_at"] = 0.0
         state["pending"] = False
+        state["candidate_serial"] = ""
+        state["candidate_count"] = 0
+        state["candidate_seen_at"] = 0.0
     emit_ocr_policy(request.sid, status="ready" if scanning else "idle", accepted=True)
     broadcast_ocr_dashboard()
 
@@ -6609,7 +2622,7 @@ def on_scanner_state(data):
 def on_process_photo_capture(data):
     global ocr_inflight
     data = data or {}
-    if not require_verified_session():
+    if not require_verified_session(require_user=False):
         return
     state = client_ocr_state.get(request.sid)
     if state is None:
@@ -6691,7 +2704,7 @@ def on_process_photo_capture(data):
 @socketio.on("save_scan")
 def on_save_scan(data):
     data = data or {}
-    if not require_verified_session():
+    if not require_verified_session(require_user=False):
         return
     ensure_csv_schema()
     serial_profile = get_sid_serial_profile(request.sid, data.get("serial_profile"))
@@ -6701,6 +2714,7 @@ def on_save_scan(data):
     serial = normalize_serial_candidate(data.get("serial", "").strip(), serial_profile)
     method = data.get("method", "manual")
     user = data.get("user", "Anonymous")
+    idempotency_key = str(data.get("idempotency_key") or "").strip()[:128]
     ocr_confidence = float(data.get("ocr_confidence", 0.0) or 0.0)
     crop_image = data.get("crop_image")
     active_box = str(data.get("box_id") or "").strip()
@@ -6716,6 +2730,12 @@ def on_save_scan(data):
         lane = ensure_lane(data.get("lane") or box_name)
     else:
         lane = ensure_lane(data.get("lane"))
+    if idempotency_key and not claim_scan_idempotency_key(idempotency_key):
+        emit("save_rejected", {
+            "serial": serial,
+            "reason": "duplicate_submit",
+        }, to=request.sid)
+        return
     if not allow_serial(serial, serial_profile):
         emit("save_rejected", {
             "serial": serial,
@@ -6822,12 +2842,13 @@ def on_save_scan(data):
     sync_lane_state_from_rows(rows)
     broadcast_queue()
     write_lane_csv_files(rows)
+    run_backup(reason="save_scan")
 
 
 @socketio.on("queue_add")
 def on_queue_add(data):
     global lane_next_id
-    if not require_verified_session():
+    if not require_verified_session(require_user=False):
         return
     serial_profile = get_sid_serial_profile(request.sid, (data or {}).get("serial_profile"))
     serial = normalize_serial_candidate((data or {}).get("serial", "").strip(), serial_profile)
@@ -6851,7 +2872,7 @@ def on_queue_add(data):
 
 @socketio.on("queue_update_current")
 def on_queue_update_current(data):
-    if not require_verified_session():
+    if not require_verified_session(require_user=False):
         return
     serial_profile = get_sid_serial_profile(request.sid, (data or {}).get("serial_profile"))
     serial = normalize_serial_candidate((data or {}).get("serial", "").strip(), serial_profile)
@@ -6873,7 +2894,7 @@ def on_queue_update_current(data):
 
 @socketio.on("lane_create")
 def on_lane_create(data):
-    if not require_verified_session():
+    if not require_verified_session(require_user=False):
         return
     lane = normalize_lane_name((data or {}).get("lane"))
     if not lane:
@@ -6885,7 +2906,7 @@ def on_lane_create(data):
 
 @socketio.on("add_to_checklist")
 def on_add_to_checklist(data):
-    if not require_verified_session():
+    if not require_verified_session(require_user=False):
         return
     serial_profile = get_sid_serial_profile(request.sid, (data or {}).get("serial_profile"))
     serial = normalize_serial_candidate((data or {}).get("serial", "").strip(), serial_profile)
@@ -6906,7 +2927,7 @@ def on_add_to_checklist(data):
 
 @socketio.on("delete_scan")
 def on_delete_scan(data):
-    if not require_verified_session():
+    if not require_verified_session(require_user=False):
         return
     serial = data.get("serial", "")
     timestamp = data.get("timestamp", "")
@@ -6927,7 +2948,7 @@ def on_delete_scan(data):
 
 @socketio.on("clear_all")
 def on_clear_all():
-    if not require_verified_session():
+    if not require_verified_session(require_user=False):
         return
     with data_lock:
         with open(CSV_FILE, "w", newline="") as f:
@@ -6936,11 +2957,12 @@ def on_clear_all():
     sync_lane_state_from_rows([])
     broadcast_queue()
     write_lane_csv_files([])
+    run_backup(reason="clear_all", force=True)
     socketio.emit("all_cleared")
 
 @socketio.on("bulk_import_checklist")
 def on_bulk_import_checklist(data):
-    if not require_verified_session():
+    if not require_verified_session(require_user=False):
         return
     text = (data or {}).get("text", "").strip()
     if not text:
@@ -6974,7 +2996,7 @@ def on_bulk_import_checklist(data):
 
 @socketio.on("get_qr_code")
 def on_get_qr_code():
-    if not require_verified_session():
+    if not require_verified_session(require_user=False):
         return
     net_url = build_network_url()
     qr_b64 = get_qr_base64(net_url)
@@ -6990,12 +3012,26 @@ def on_get_qr_code():
 
 @socketio.on("box_create")
 def on_box_create(data):
-    if not require_verified_session():
+    if not require_verified_session(require_user=False):
         return
-    name = (data or {}).get("name", "").strip()
-    if not name: return
+    raw_name = str((data or {}).get("name", "")).strip()
+    if not raw_name:
+        emit("box_rejected", {"reason": "name_required"}, to=request.sid)
+        return
+    name = re.sub(r"\s+", " ", raw_name)[:64].strip()
+    if not name:
+        emit("box_rejected", {"reason": "name_required"}, to=request.sid)
+        return
+    # Reuse existing box by name (case-insensitive) to avoid accidental duplicates.
+    for existing_id, existing_box in box_registry.items():
+        existing_name = str(existing_box.get("name") or "").strip().lower()
+        if existing_name and existing_name == name.lower():
+            join_box_for_sid(request.sid, existing_id)
+            emit("box_joined", {"ok": True, "box_id": existing_id}, to=request.sid)
+            return
     serial_profile = get_sid_serial_profile(request.sid, (data or {}).get("serial_profile"))
-    box_id = str(int(time.time() * 1000))
+    # Millisecond timestamps can collide under concurrent creates; use random id.
+    box_id = f"box_{int(time.time() * 1000)}_{secrets.token_hex(3)}"
     box_registry[box_id] = normalize_box_record(box_id, {
         "name": name,
         "serial_profile": serial_profile,
@@ -7013,11 +3049,16 @@ def on_box_create(data):
 
 @socketio.on("box_import_target")
 def on_box_import_target(data):
-    if not require_verified_session():
+    if not require_verified_session(require_user=False):
         return
-    box_id = (data or {}).get("box_id")
+    box_id = str((data or {}).get("box_id") or "").strip()
     text = (data or {}).get("text", "").strip()
-    if not box_id or box_id not in box_registry or not text: return
+    if not box_id or box_id not in box_registry:
+        emit("box_rejected", {"reason": "box_not_found", "box_id": box_id}, to=request.sid)
+        return
+    if not text:
+        emit("box_rejected", {"reason": "empty_import", "box_id": box_id}, to=request.sid)
+        return
     if box_registry[box_id].get("closed"):
         emit("box_rejected", {"reason": "box_closed", "box_id": box_id}, to=request.sid)
         return
@@ -7025,22 +3066,39 @@ def on_box_import_target(data):
     serial_profile = get_sid_serial_profile(request.sid, (data or {}).get("serial_profile"))
     raw_list = re.split(r"[\n,\s]+", text)
     new_targets = []
+    batch_seen = set()
+    ignored_count = 0
     for raw in raw_list:
         serial = normalize_serial_candidate(raw.strip(), serial_profile)
-        if serial and serial not in box_registry[box_id]["target"]:
+        if serial and serial not in box_registry[box_id]["target"] and serial not in batch_seen:
             new_targets.append(serial)
+            batch_seen.add(serial)
+        elif raw.strip():
+            ignored_count += 1
+    if not new_targets:
+        emit("box_rejected", {"reason": "no_valid_serials", "box_id": box_id}, to=request.sid)
+        return
     
     box_registry[box_id]["target"].extend(new_targets)
     box_registry[box_id]["last_active"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     save_box_registry()
     emit_boxes_updated()
+    emit("box_imported", {
+        "ok": True,
+        "box_id": box_id,
+        "added_count": len(new_targets),
+        "ignored_count": ignored_count,
+    }, to=request.sid)
 
 
 @socketio.on("box_delete")
 def on_box_delete(data):
-    if not require_verified_session():
+    if not require_verified_session(require_user=False):
         return
-    box_id = (data or {}).get("box_id")
+    box_id = str((data or {}).get("box_id") or "").strip()
+    if not box_id or box_id not in box_registry:
+        emit("box_rejected", {"reason": "box_not_found", "box_id": box_id}, to=request.sid)
+        return
     if box_id in box_registry:
         for sid, joined_box in list(sid_box_membership.items()):
             if joined_box == box_id:
@@ -7049,11 +3107,12 @@ def on_box_delete(data):
         del box_registry[box_id]
         save_box_registry()
         emit_boxes_updated()
+        emit("box_deleted", {"ok": True, "box_id": box_id}, to=request.sid)
 
 
 @socketio.on("box_join")
 def on_box_join(data):
-    if not require_verified_session():
+    if not require_verified_session(require_user=False):
         return
     box_id = str((data or {}).get("box_id") or "").strip()
     if not box_id or box_id not in box_registry:
@@ -7070,7 +3129,7 @@ def on_box_join(data):
 
 @socketio.on("box_leave")
 def on_box_leave():
-    if not require_verified_session():
+    if not require_verified_session(require_user=False):
         return
     leave_box_for_sid(request.sid, notify=True)
     emit("box_joined", {"ok": True, "box_id": None}, to=request.sid)
@@ -7078,7 +3137,7 @@ def on_box_leave():
 
 @socketio.on("box_set_closed")
 def on_box_set_closed(data):
-    if not require_verified_session():
+    if not require_verified_session(require_user=False):
         return
     box_id = str((data or {}).get("box_id") or "").strip()
     closed = bool((data or {}).get("closed"))
@@ -7089,11 +3148,12 @@ def on_box_set_closed(data):
     box_registry[box_id]["last_active"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     save_box_registry()
     emit_boxes_updated()
+    emit("box_state_changed", {"ok": True, "box_id": box_id, "closed": closed}, to=request.sid)
 
 
 @socketio.on("get_boxes")
 def on_get_boxes():
-    if not require_verified_session():
+    if not require_verified_session(require_user=False):
         return
     load_box_registry()
     emit_boxes_updated(request.sid)
@@ -7110,7 +3170,7 @@ def handle_ocr_frame(data):
     global ocr_inflight
     data = data or {}
     sid = request.sid
-    if not require_verified_session():
+    if not require_verified_session(require_user=False):
         return
     state = client_ocr_state.get(sid)
     if state is None:
@@ -7162,10 +3222,11 @@ def handle_ocr_frame(data):
         print(f"-> OCR Frame #{frame_counts[sid]} received from {sid} (Size: {len(img_data)} chars)")
         
     try:
-        ocr_result = tpool.execute(recognize_text_from_binary, img_data, serial_profile)
+        ocr_result = recognize_text_from_binary(img_data, serial_profile)
         text = (ocr_result or {}).get("text", "") if isinstance(ocr_result, dict) else (ocr_result or "")
         confidence = float((ocr_result or {}).get("confidence", 0.0)) if isinstance(ocr_result, dict) else 0.0
         serial_hint = normalize_serial_candidate((ocr_result or {}).get("serial_hint", ""), serial_profile) if isinstance(ocr_result, dict) else ""
+        ocr_rotation = int((ocr_result or {}).get("rotation_deg", 0) or 0) if isinstance(ocr_result, dict) else 0
         ocr_variant = (ocr_result or {}).get("variant", "primary") if isinstance(ocr_result, dict) else "primary"
         if confidence > 0:
             ocr_metrics["confidence_samples"].append(confidence)
@@ -7189,12 +3250,117 @@ def handle_ocr_frame(data):
     next_delay_ms = get_client_ocr_interval_ms(state)
 
     if not text:
+        state["candidate_serial"] = ""
+        state["candidate_count"] = 0
+        state["candidate_seen_at"] = 0.0
         ocr_metrics["no_text"] += 1
         emit_ocr_policy(sid, status="no_text", accepted=True, next_delay_ms=next_delay_ms, ocr_confidence=0.0)
         broadcast_ocr_dashboard()
         return
 
+    parsed_serial = extract_serial_from_text(text, serial_profile)
+    context_serial = extract_serial_from_strong_context(text or "", serial_profile)
+    hint_serial = serial_hint if allow_serial(serial_hint, serial_profile) else ""
+    parsed_valid = parsed_serial if allow_serial(parsed_serial, serial_profile) else ""
+    context_valid = context_serial if allow_serial(context_serial, serial_profile) else ""
+    if serial_profile == "apple":
+        possible_serial = parsed_valid or hint_serial or context_valid
+    else:
+        possible_serial = hint_serial or parsed_valid or context_valid
+    has_marker = has_label_marker(text or "", serial_profile)
+    dell_marker_match = has_dell_marker_match(text or "", possible_serial) if serial_profile == "dell" else False
+    context_strong = has_strong_serial_context(text or "", possible_serial, serial_profile)
+    required_conf = OCR_ACCEPT_CONTEXT_MIN_CONFIDENCE if context_strong else OCR_ACCEPT_VALID_MIN_CONFIDENCE
+    if serial_profile == "dell":
+        required_conf = max(required_conf, 0.62 if dell_marker_match else 0.86)
+    # Label-only gate for live flow: require marker unless direct serial is high-confidence.
+    if not has_marker and not (
+        possible_serial
+        and allow_serial(possible_serial, serial_profile)
+        and confidence >= max(0.9, OCR_ACCEPT_VALID_MIN_CONFIDENCE)
+    ):
+        state["candidate_serial"] = ""
+        state["candidate_count"] = 0
+        state["candidate_seen_at"] = 0.0
+        ocr_metrics["no_match"] += 1
+        emit_ocr_policy(
+            sid,
+            status="no_match",
+            accepted=True,
+            next_delay_ms=get_client_ocr_interval_ms(state, 120),
+            ocr_confidence=confidence,
+        )
+        broadcast_ocr_dashboard()
+        return
+    if (
+        possible_serial
+        and allow_serial(possible_serial, serial_profile)
+        and confidence >= required_conf
+    ):
+        if confidence < OCR_POPUP_MIN_CONFIDENCE:
+            state["candidate_serial"] = ""
+            state["candidate_count"] = 0
+            state["candidate_seen_at"] = 0.0
+            emit_ocr_policy(
+                sid,
+                status="low_confidence",
+                accepted=False,
+                next_delay_ms=get_client_ocr_interval_ms(state, 220),
+                ocr_confidence=confidence,
+            )
+            broadcast_ocr_dashboard()
+            return
+        required_streak = OCR_MATCH_CONFIRM_STREAK_DELL if serial_profile == "dell" else OCR_MATCH_CONFIRM_STREAK
+        if serial_profile == "dell" and not dell_marker_match:
+            required_streak = max(required_streak, 2)
+        now_ts = time.time()
+        prev_candidate = state.get("candidate_serial", "")
+        prev_seen_at = float(state.get("candidate_seen_at", 0.0) or 0.0)
+        if prev_candidate == possible_serial and (now_ts - prev_seen_at) <= OCR_MATCH_CONFIRM_WINDOW_SEC:
+            state["candidate_count"] = int(state.get("candidate_count", 0) or 0) + 1
+        else:
+            state["candidate_serial"] = possible_serial
+            state["candidate_count"] = 1
+        state["candidate_seen_at"] = now_ts
+
+        if state["candidate_count"] < required_streak:
+            emit_ocr_policy(
+                sid,
+                status="stabilizing",
+                accepted=True,
+                next_delay_ms=get_client_ocr_interval_ms(state, 80),
+                ocr_confidence=confidence,
+            )
+            broadcast_ocr_dashboard()
+            return
+
+        duplicate_gap_ok = (
+            possible_serial != state.get("last_result")
+            or (time.time() - state.get("last_result_at", 0.0)) > 2.0
+        )
+        if duplicate_gap_ok:
+            state["last_result"] = possible_serial
+            state["last_result_at"] = time.time()
+            ocr_metrics["matches"] += 1
+            preview_rotation = int(ocr_rotation or 0) % 360
+            if preview_rotation == 0:
+                preview_rotation = infer_best_rotation_deg(img_data, serial_profile)
+            print(f"-> OCR MATCH: '{possible_serial}' for client {sid} in {latency_ms}ms")
+            emit_ocr_success(
+                sid,
+                possible_serial,
+                next_delay_ms=next_delay_ms,
+                ocr_confidence=confidence,
+                serial_profile=serial_profile,
+                ocr_rotation=preview_rotation,
+            )
+            broadcast_ocr_dashboard()
+            return
+
     if confidence <= OCR_MIN_CONFIDENCE:
+        state["candidate_serial"] = ""
+        state["candidate_count"] = 0
+        state["candidate_seen_at"] = 0.0
         emit_ocr_policy(
             sid,
             status="low_confidence",
@@ -7205,21 +3371,9 @@ def handle_ocr_frame(data):
         broadcast_ocr_dashboard()
         return
 
-    possible_serial = serial_hint or extract_serial_from_text(text, serial_profile)
-    if possible_serial and allow_serial(possible_serial, serial_profile):
-        duplicate_gap_ok = (
-            possible_serial != state.get("last_result")
-            or (time.time() - state.get("last_result_at", 0.0)) > 2.0
-        )
-        if duplicate_gap_ok:
-            state["last_result"] = possible_serial
-            state["last_result_at"] = time.time()
-            ocr_metrics["matches"] += 1
-            print(f"-> OCR MATCH: '{possible_serial}' for client {sid} in {latency_ms}ms")
-            emit_ocr_success(sid, possible_serial, next_delay_ms=next_delay_ms, ocr_confidence=confidence, serial_profile=serial_profile)
-            broadcast_ocr_dashboard()
-            return
-
+    state["candidate_serial"] = ""
+    state["candidate_count"] = 0
+    state["candidate_seen_at"] = 0.0
     ocr_metrics["no_match"] += 1
     emit_ocr_policy(sid, status="no_match", accepted=True, next_delay_ms=next_delay_ms, ocr_confidence=confidence)
     broadcast_ocr_dashboard()
@@ -7293,15 +3447,6 @@ def open_browser_delayed(url, delay=1.5):
     threading.Thread(target=_open, daemon=True).start()
 
 
-class QuietWSGI:
-    """Suppress noisy SSL handshake/client disconnect lines from eventlet WSGI log."""
-    def write(self, _msg):
-        return
-
-    def flush(self):
-        return
-
-
 if __name__ == "__main__":
     PORT = 5000
     CERT = os.path.join(BASE_DIR, "cert.pem")
@@ -7319,6 +3464,10 @@ if __name__ == "__main__":
     print(f"  \033[1;32m→  Local:\033[0m    {local_url}")
     print(f"  \033[1;36m→  Network:\033[0m  {net_url}")
     print(f"  \033[1;33m→  CSV:\033[0m      {CSV_FILE}")
+    if JOIN_PIN_HASH:
+        print(f"  \033[1;34m→  Join PIN:\033[0m  configured via JOIN_PIN_HASH")
+    else:
+        print(f"  \033[1;34m→  Join PIN:\033[0m  {JOIN_PIN}")
     if has_ssl:
         print(f"  \033[1;35m→  SSL:\033[0m      ✅ HTTPS enabled")
     print("  " + "─" * 48)
@@ -7329,6 +3478,8 @@ if __name__ == "__main__":
     else:
         print()
         print("  \033[1;33m💡 HTTP mode enabled. Use a trusted tunnel for phone camera access.\033[0m")
+    if JOIN_PIN_DEFAULTED and not JOIN_PIN_HASH:
+        print("  \033[1;33mℹ JOIN_PIN not set in environment; using local default PIN 2026.\033[0m")
 
     if HAS_QRCODE:
         print()
@@ -7350,13 +3501,27 @@ if __name__ == "__main__":
         for p in (CSV_FILE, CHECK_FILE, USERS_FILE, DB_FILE, BOXES_FILE, CROPS_MANIFEST_FILE):
             if os.path.isfile(p):
                 secure_chmod(p)
+        run_backup(reason="startup", force=True)
     except Exception as e:
         print(f"-> Lane CSV sync warning: {e}")
 
     open_browser_delayed(local_url)
 
     if has_ssl:
-        socketio.run(app, host="0.0.0.0", port=PORT, debug=False,
-                     keyfile=KEY, certfile=CERT, log=QuietWSGI())
+        socketio.run(
+            app,
+            host="0.0.0.0",
+            port=PORT,
+            debug=False,
+            use_reloader=False,
+            keyfile=KEY,
+            certfile=CERT,
+        )
     else:
-        socketio.run(app, host="0.0.0.0", port=PORT, debug=False, log=QuietWSGI())
+        socketio.run(
+            app,
+            host="0.0.0.0",
+            port=PORT,
+            debug=False,
+            use_reloader=False,
+        )
